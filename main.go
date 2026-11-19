@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -14,14 +15,32 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
+
+const (
+	minInterval = 10 * time.Second
+	// A long outage must not turn into one huge poll that GitLab has to page through.
+	maxWindow        = 6 * time.Hour
+	maxJobPages      = 20
+	maxProjectPages  = 1000
+	maxBodyBytes     = 32 << 20
+	maxDrainBytes    = 1 << 20
+	maxRetryAfter    = 30 * time.Second
+	maxRetries       = 2
+	maxPartLen       = 64
+	shutdownTimeout  = 5 * time.Second
+	defaultSeriesTTL = 48 * time.Hour
+)
 
 type config struct {
 	gitlabURL string
@@ -30,6 +49,46 @@ type config struct {
 	interval  time.Duration
 	lookback  time.Duration
 	listen    string
+	seriesTTL time.Duration
+}
+
+func parseDuration(name, def string) (time.Duration, error) {
+	d, err := time.ParseDuration(env(name, def))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	return d, nil
+}
+
+func validateGitLabURL(raw string, allowInsecure bool) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("GITLAB_URL %q is not a URL; use a form like https://gitlab.example.com", raw)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && allowInsecure:
+	case u.Scheme == "http":
+		return errors.New("GITLAB_URL uses http, which would send the token in clear text; use https or set ALLOW_INSECURE_HTTP=true")
+	default:
+		return fmt.Errorf("GITLAB_URL must start with https://, got scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return errors.New("GITLAB_URL must not contain credentials; put the token in GITLAB_TOKEN_FILE")
+	}
+	return nil
+}
+
+func validateToken(t string) error {
+	if t == "" {
+		return errors.New("the token file is empty; write the access token into it")
+	}
+	for _, r := range t {
+		if unicode.IsControl(r) {
+			return errors.New("the token file contains a control character after trimming; it must hold only the token")
+		}
+	}
+	return nil
 }
 
 func loadConfig() (config, error) {
@@ -39,21 +98,39 @@ func loadConfig() (config, error) {
 		listen:    env("LISTEN", ":9168"),
 	}
 	var err error
-	if c.interval, err = time.ParseDuration(env("INTERVAL", "2m")); err != nil {
-		return c, fmt.Errorf("INTERVAL: %w", err)
+	if c.interval, err = parseDuration("INTERVAL", "2m"); err != nil {
+		return c, err
 	}
-	if c.lookback, err = time.ParseDuration(env("LOOKBACK", "15m")); err != nil {
-		return c, fmt.Errorf("LOOKBACK: %w", err)
+	if c.interval < minInterval {
+		return c, fmt.Errorf("INTERVAL %s is too short; use %s or more so GitLab is not hammered", c.interval, minInterval)
+	}
+	if c.lookback, err = parseDuration("LOOKBACK", "15m"); err != nil {
+		return c, err
+	}
+	if c.lookback <= 0 {
+		return c, errors.New("LOOKBACK must be greater than zero")
+	}
+	if c.seriesTTL, err = parseDuration("SERIES_TTL", defaultSeriesTTL.String()); err != nil {
+		return c, err
+	}
+	if c.seriesTTL <= 0 {
+		return c, errors.New("SERIES_TTL must be greater than zero")
 	}
 	tokenFile := env("GITLAB_TOKEN_FILE", "")
 	if c.gitlabURL == "" || c.group == "" || tokenFile == "" {
 		return c, errors.New("set GITLAB_URL, GITLAB_GROUP and GITLAB_TOKEN_FILE")
+	}
+	if err := validateGitLabURL(c.gitlabURL, os.Getenv("ALLOW_INSECURE_HTTP") == "true"); err != nil {
+		return c, err
 	}
 	b, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return c, fmt.Errorf("read the token: %w", err)
 	}
 	c.token = strings.TrimSpace(string(b))
+	if err := validateToken(c.token); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -65,19 +142,20 @@ func env(k, def string) string {
 }
 
 type project struct {
-	ID            int    `json:"id"`
-	Path          string `json:"path"`
-	DefaultBranch string `json:"default_branch"`
+	ID                int    `json:"id"`
+	PathWithNamespace string `json:"path_with_namespace"`
+	DefaultBranch     string `json:"default_branch"`
 }
 
 type job struct {
-	ID             int     `json:"id"`
-	Name           string  `json:"name"`
-	Status         string  `json:"status"`
-	Ref            string  `json:"ref"`
-	Duration       float64 `json:"duration"`
-	QueuedDuration float64 `json:"queued_duration"`
-	FinishedAt     string  `json:"finished_at"`
+	ID             int      `json:"id"`
+	Name           string   `json:"name"`
+	Status         string   `json:"status"`
+	Ref            string   `json:"ref"`
+	Duration       *float64 `json:"duration"`
+	QueuedDuration *float64 `json:"queued_duration"`
+	CreatedAt      string   `json:"created_at"`
+	FinishedAt     string   `json:"finished_at"`
 	Runner         *struct {
 		Description string `json:"description"`
 	} `json:"runner"`
@@ -92,41 +170,95 @@ type gitlab struct {
 	client *http.Client
 }
 
-var nextPage = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+// newClient never follows a redirect: the token header would travel with it.
+func newClient() *http.Client {
+	return &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
 
-// get decodes every page of a list endpoint until stop says enough.
-func get[T any](ctx context.Context, g gitlab, path string, stop func([]T) bool) ([]T, error) {
-	var all []T
-	next := g.base + "/api/v4/" + path
-	for next != "" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
+type statusError struct {
+	code   int
+	status string
+	path   string
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("GET %s: %s", e.path, e.status) }
+
+func retryAfter(h http.Header) (time.Duration, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(h.Get("Retry-After")))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
+}
+
+// fetch returns the body of one successful response, waiting out a short 429.
+func (g gitlab) fetch(ctx context.Context, path string) ([]byte, http.Header, error) {
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.base+"/api/v4/"+path, nil)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		req.Header.Set("PRIVATE-TOKEN", g.token)
 		resp, err := g.client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		var page []T
-		err = json.NewDecoder(resp.Body).Decode(&page)
-		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("GET %s: %s", path, resp.Status)
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+			resp.Body.Close()
+			wait, ok := retryAfter(resp.Header)
+			if resp.StatusCode == http.StatusTooManyRequests && ok && wait <= maxRetryAfter && attempt < maxRetries {
+				select {
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				case <-time.After(wait):
+					continue
+				}
+			}
+			return nil, nil, &statusError{code: resp.StatusCode, status: resp.Status, path: path}
 		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("GET %s: %w", path, err)
+			return nil, nil, fmt.Errorf("GET %s: %w", path, err)
 		}
-		all = append(all, page...)
-		if stop != nil && stop(page) {
-			break
+		if len(body) > maxBodyBytes {
+			return nil, nil, fmt.Errorf("GET %s: response larger than %d bytes", path, maxBodyBytes)
 		}
-		next = ""
-		if m := nextPage.FindStringSubmatch(resp.Header.Get("Link")); m != nil {
-			next = m[1]
-		}
+		return body, resp.Header, nil
 	}
-	return all, nil
+}
+
+// get decodes the pages of a list endpoint until stop says enough or maxPages
+// is reached. The next page is built from X-Next-Page against the configured
+// base, never from a URL the server sent, so the token stays on that host.
+func get[T any](ctx context.Context, g gitlab, path string, maxPages int, stop func([]T) bool) (all []T, capped bool, err error) {
+	next := path
+	for page := 1; ; page++ {
+		body, hdr, err := g.fetch(ctx, next)
+		if err != nil {
+			return nil, false, err
+		}
+		var items []T
+		if err := json.Unmarshal(body, &items); err != nil {
+			return nil, false, fmt.Errorf("GET %s: %w", path, err)
+		}
+		all = append(all, items...)
+		if stop != nil && stop(items) {
+			return all, false, nil
+		}
+		np, err := strconv.Atoi(hdr.Get("X-Next-Page"))
+		if err != nil || np <= 0 {
+			return all, false, nil
+		}
+		if page >= maxPages {
+			return all, true, nil
+		}
+		next = path + "&page=" + strconv.Itoa(np)
+	}
 }
 
 // Buckets in seconds, from a short check to a stack job near its limit.
@@ -136,9 +268,10 @@ type histogram struct {
 	counts []uint64
 	sum    float64
 	count  uint64
+	last   time.Time
 }
 
-func (h *histogram) observe(v float64) {
+func (h *histogram) observe(v float64, now time.Time) {
 	if h.counts == nil {
 		h.counts = make([]uint64, len(buckets))
 	}
@@ -149,17 +282,21 @@ func (h *histogram) observe(v float64) {
 	}
 	h.sum += v
 	h.count++
+	h.last = now
 }
 
 type key struct{ project, job, part, runner, status, ref string }
 
 type store struct {
-	mu        sync.Mutex
-	duration  map[key]*histogram
-	queued    map[key]*histogram
-	seen      map[int]time.Time
-	lastPoll  time.Time
-	pollError float64
+	mu              sync.Mutex
+	duration        map[key]*histogram
+	queued          map[key]*histogram
+	seen            map[int]time.Time
+	lastPoll        time.Time
+	lastPollSeconds float64
+	pollError       float64
+	projectsSkipped float64
+	pageCapHits     float64
 }
 
 func newStore() *store {
@@ -180,11 +317,19 @@ func splitName(n string) (string, string) {
 	return strings.TrimSpace(m[1]), m[3]
 }
 
+func truncateRunes(v string, n int) string {
+	if utf8.RuneCountInString(v) <= n {
+		return v
+	}
+	return string([]rune(v)[:n])
+}
+
 func (s *store) add(projectPath string, j job, defaultRef string) {
 	finished, err := time.Parse(time.RFC3339, j.FinishedAt)
 	if err != nil {
 		return
 	}
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.seen[j.ID]; ok {
@@ -192,6 +337,7 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	}
 	s.seen[j.ID] = finished
 	name, part := splitName(j.Name)
+	part = truncateRunes(part, maxPartLen)
 	runner := "none"
 	if j.Runner != nil && j.Runner.Description != "" {
 		runner = j.Runner.Description
@@ -205,14 +351,17 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	k := key{projectPath, name, part, runner, j.Status, ref}
 	for _, o := range []struct {
 		m map[key]*histogram
-		v float64
+		v *float64
 	}{{s.duration, j.Duration}, {s.queued, j.QueuedDuration}} {
+		if o.v == nil {
+			continue
+		}
 		h := o.m[k]
 		if h == nil {
 			h = &histogram{}
 			o.m[k] = h
 		}
-		h.observe(o.v)
+		h.observe(*o.v, now)
 	}
 }
 
@@ -227,36 +376,91 @@ func (s *store) forget(before time.Time) {
 	}
 }
 
-func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store) error {
-	projects, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&per_page=100", nil)
+// expire drops series that saw no job for ttl, so renamed jobs and runners
+// do not pile up for the life of the process.
+func (s *store) expire(now time.Time, ttl time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range []map[key]*histogram{s.duration, s.queued} {
+		for k, h := range m {
+			if now.Sub(h.last) > ttl {
+				delete(m, k)
+			}
+		}
+	}
+}
+
+func (s *store) count(c *float64) {
+	s.mu.Lock()
+	*c++
+	s.mu.Unlock()
+}
+
+// jobTime is the job's finish time, or its creation time when GitLab has none.
+func jobTime(j job) (time.Time, bool) {
+	for _, v := range []string{j.FinishedAt, j.CreatedAt} {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func isStatus(err error, match func(code int) bool) bool {
+	var se *statusError
+	return errors.As(err, &se) && match(se.code)
+}
+
+func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store, log *slog.Logger) error {
+	projects, capped, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&per_page=100", maxProjectPages, nil)
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, p := range projects {
-		older := func(page []job) bool {
-			if len(page) == 0 {
+	if capped {
+		return fmt.Errorf("the group has more than %d pages of projects", maxProjectPages)
+	}
+	older := func(page []job) bool {
+		if len(page) == 0 {
+			return true
+		}
+		for _, j := range page {
+			if t, ok := jobTime(j); ok && t.Before(since) {
 				return true
 			}
-			t, err := time.Parse(time.RFC3339, page[len(page)-1].FinishedAt)
-			return err == nil && t.Before(since)
 		}
-		jobs, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), older)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", p.Path, err))
+		return false
+	}
+	var errs []error
+	for _, p := range projects {
+		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
+		switch {
+		case isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound }):
+			log.Debug("skipping a project GitLab will not show", "project", p.PathWithNamespace, "err", err)
+			s.count(&s.projectsSkipped)
 			continue
+		case isStatus(err, func(c int) bool { return c == http.StatusTooManyRequests || c >= 500 }):
+			return errors.Join(append(errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))...)
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))
+			continue
+		}
+		if capped {
+			log.Warn("stopped paging a project at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+			s.count(&s.pageCapHits)
 		}
 		for _, j := range jobs {
 			if t, err := time.Parse(time.RFC3339, j.FinishedAt); err == nil && !t.Before(since) {
-				s.add(p.Path, j, p.DefaultBranch)
+				s.add(p.PathWithNamespace, j, p.DefaultBranch)
 			}
 		}
 	}
 	return errors.Join(errs...)
 }
 
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
 func label(k key) string {
-	esc := func(v string) string { return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(v) }
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 	return fmt.Sprintf(`project="%s",job="%s",part="%s",runner="%s",status="%s",ref="%s"`,
 		esc(k.project), esc(k.job), esc(k.part), esc(k.runner), esc(k.status), esc(k.ref))
 }
@@ -286,8 +490,34 @@ func (s *store) write(w *strings.Builder) {
 		}
 	}
 	fmt.Fprintf(w, "# HELP ci_job_exporter_build_info Version of the running exporter.\n# TYPE ci_job_exporter_build_info gauge\nci_job_exporter_build_info{version=\"%s\"} 1\n", version)
-	fmt.Fprintf(w, "# HELP ci_job_exporter_last_poll_timestamp_seconds When GitLab was last read without error.\n# TYPE ci_job_exporter_last_poll_timestamp_seconds gauge\nci_job_exporter_last_poll_timestamp_seconds %d\n", s.lastPoll.Unix())
+	var last int64
+	if !s.lastPoll.IsZero() {
+		last = s.lastPoll.Unix()
+	}
+	fmt.Fprintf(w, "# HELP ci_job_exporter_last_poll_timestamp_seconds When GitLab was last read without error; 0 before the first success.\n# TYPE ci_job_exporter_last_poll_timestamp_seconds gauge\nci_job_exporter_last_poll_timestamp_seconds %d\n", last)
+	fmt.Fprintf(w, "# HELP ci_job_exporter_last_poll_duration_seconds How long the last finished poll took.\n# TYPE ci_job_exporter_last_poll_duration_seconds gauge\nci_job_exporter_last_poll_duration_seconds %g\n", s.lastPollSeconds)
 	fmt.Fprintf(w, "# HELP ci_job_exporter_poll_errors_total Polls that failed for at least one project.\n# TYPE ci_job_exporter_poll_errors_total counter\nci_job_exporter_poll_errors_total %g\n", s.pollError)
+	fmt.Fprintf(w, "# HELP ci_job_exporter_projects_skipped_total Project reads GitLab refused with 403 or 404.\n# TYPE ci_job_exporter_projects_skipped_total counter\nci_job_exporter_projects_skipped_total %g\n", s.projectsSkipped)
+	fmt.Fprintf(w, "# HELP ci_job_exporter_page_limit_hits_total Project reads stopped at the page limit.\n# TYPE ci_job_exporter_page_limit_hits_total counter\nci_job_exporter_page_limit_hits_total %g\n", s.pageCapHits)
+}
+
+// windowStart keeps a poll from reaching further back than maxWindow.
+func windowStart(since, now time.Time) time.Time {
+	if floor := now.Add(-maxWindow); since.Before(floor) {
+		return floor
+	}
+	return since
+}
+
+// advance moves the window only after a good poll. It then reaches back one
+// interval, for jobs that finished while the poll ran; ids already seen are
+// skipped. After a failure the window stays, so no job is lost between two
+// good polls.
+func advance(since, started time.Time, interval time.Duration, err error) time.Time {
+	if err != nil {
+		return since
+	}
+	return started.Add(-interval)
 }
 
 func main() {
@@ -300,15 +530,20 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	g := gitlab{base: c.gitlabURL, token: c.token, client: &http.Client{Timeout: 30 * time.Second}}
+	g := gitlab{base: c.gitlabURL, token: c.token, client: newClient()}
 	s := newStore()
 
 	go func() {
 		since := time.Now().Add(-c.lookback)
 		for {
 			started := time.Now()
-			err := poll(ctx, g, c.group, since, s)
+			from := windowStart(since, started)
+			err := poll(ctx, g, c.group, from, s, log)
+			if ctx.Err() != nil {
+				return
+			}
 			s.mu.Lock()
+			s.lastPollSeconds = time.Since(started).Seconds()
 			if err != nil {
 				s.pollError++
 			} else {
@@ -318,10 +553,9 @@ func main() {
 			if err != nil {
 				log.Warn("reading GitLab failed", "err", err)
 			}
-			// The next poll looks back over this one too, for jobs that finished
-			// while it ran; ids already seen are skipped.
-			since = started.Add(-c.interval)
-			s.forget(since.Add(-time.Hour))
+			since = advance(since, started, c.interval, err)
+			s.forget(from.Add(-time.Hour))
+			s.expire(time.Now(), c.seriesTTL)
 			select {
 			case <-ctx.Done():
 				return
@@ -337,14 +571,29 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(b.String()))
 	})
-	srv := &http.Server{Addr: c.listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{
+		Addr:              c.listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
 	}()
 	log.Info("serving metrics", "listen", c.listen, "group", c.group)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("serving metrics failed", "err", err)
+		stop()
+		<-shutdownDone
 		os.Exit(1)
 	}
+	<-shutdownDone
 }

@@ -16,16 +16,19 @@ GitLab REST API instead. It is read-only and uses the standard library only.
 | `ci_job_duration_seconds` | histogram | How long a finished job ran. |
 | `ci_job_queued_seconds` | histogram | How long a finished job waited for a runner. |
 | `ci_job_exporter_build_info` | gauge | Always 1; the `version` label is the release version. |
-| `ci_job_exporter_last_poll_timestamp_seconds` | gauge | When GitLab was last read without error. |
+| `ci_job_exporter_last_poll_timestamp_seconds` | gauge | When GitLab was last read without error; 0 before the first success. |
+| `ci_job_exporter_last_poll_duration_seconds` | gauge | How long the last finished poll took. |
 | `ci_job_exporter_poll_errors_total` | counter | Polls that failed for at least one project. |
+| `ci_job_exporter_projects_skipped_total` | counter | Project reads GitLab refused with 403 or 404; these are skipped, not errors. |
+| `ci_job_exporter_page_limit_hits_total` | counter | Project reads stopped at the limit of 20 pages of jobs. |
 
 The two histograms carry these labels:
 
 | Label | Meaning |
 | --- | --- |
-| `project` | Project path. |
+| `project` | Full project path including groups, GitLab's `path_with_namespace`, for example `my-group/sub/my-project`. |
 | `job` | Job name. A parallel suffix such as `: [1/2]` or ` 1/2` is removed. |
-| `part` | The parallel part, for example `1/2`; empty if the job is not parallel. |
+| `part` | The parallel part, for example `1/2`; empty if the job is not parallel. Cut at 64 characters. |
 | `runner` | Runner description, or `none` if no runner took the job. |
 | `status` | `success`, `failed` or `canceled`. |
 | `ref` | `default` (the project's default branch), `merge_request` or `branch`. |
@@ -38,11 +41,13 @@ All settings are environment variables.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `GITLAB_URL` | required | Base URL of the GitLab instance, for example `https://gitlab.example.com`. |
+| `GITLAB_URL` | required | Base URL of the GitLab instance, for example `https://gitlab.example.com`. Must be `https` unless `ALLOW_INSECURE_HTTP=true`. |
+| `ALLOW_INSECURE_HTTP` | `false` | Set to `true` to accept an `http` GitLab URL. The token then travels in clear text. |
 | `GITLAB_GROUP` | required | Group path or ID. Subgroups are included, archived projects are not. |
 | `GITLAB_TOKEN_FILE` | required | Path to a file that contains the access token. |
-| `INTERVAL` | `2m` | Time between polls. |
-| `LOOKBACK` | `15m` | How far back the first poll looks for finished jobs. |
+| `INTERVAL` | `2m` | Time between polls; at least `10s`. |
+| `LOOKBACK` | `15m` | How far back the first poll looks for finished jobs; greater than zero. No poll reaches back further than 6 hours. |
+| `SERIES_TTL` | `48h` | A series that saw no finished job for this long is dropped. |
 | `LISTEN` | `:9168` | Address to serve `/metrics` on. |
 
 ## Token
@@ -50,7 +55,10 @@ All settings are environment variables.
 Create a group or project access token with the role Reporter and only the
 scope `read_api`. The exporter never writes to GitLab. Put the token in a
 file and point `GITLAB_TOKEN_FILE` at it; the token is not read from an
-environment variable on purpose.
+environment variable on purpose. The file is read once at start, so restart
+the exporter after you rotate the token. The exporter refuses to start if the
+file is empty or holds control characters, and it never follows a redirect, so
+the token is only ever sent to `GITLAB_URL`.
 
 ## Install
 
@@ -60,19 +68,21 @@ and windows/amd64, named `gitlab-ci-job-exporter_<version>_<os>_<arch>.tar.gz` (
 on Windows), each with `LICENSE` and `README.md`, and a `checksums.txt` with
 SHA-256 sums. The container image for linux/amd64 and linux/arm64 is
 `ghcr.io/praetorianer777/gitlab-ci-job-exporter`, tagged with the version and
-`latest`.
+`latest` (pre-releases such as `v1.0.0-rc.1` get no `latest`). Pin the version
+tag in production.
 
 ## Run
 
 With Docker:
 
 ```sh
-docker run -d --name gitlab-ci-job-exporter -p 9168:9168 \
+docker run -d --name gitlab-ci-job-exporter -p 127.0.0.1:9168:9168 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
   -e GITLAB_URL=https://gitlab.example.com \
   -e GITLAB_GROUP=my-group \
   -e GITLAB_TOKEN_FILE=/run/secrets/gitlab_token \
   -v "$PWD/gitlab_token":/run/secrets/gitlab_token:ro \
-  ghcr.io/praetorianer777/gitlab-ci-job-exporter:latest
+  ghcr.io/praetorianer777/gitlab-ci-job-exporter:v0.2.0
 ```
 
 The image is built from `scratch` and runs as user 65534, so the token file
@@ -126,8 +136,22 @@ sum by (runner) (rate(ci_job_queued_seconds_count[1d]))
 - A job that finishes between two polls is seen at the next poll, so the
   metrics lag by up to `INTERVAL`.
 - A project that cannot be read is skipped for that poll and counted in
-  `ci_job_exporter_poll_errors_total`.
+  `ci_job_exporter_poll_errors_total`. A project GitLab answers with 403 or
+  404 is skipped quietly and counted in `ci_job_exporter_projects_skipped_total`.
+  A 429 or 5xx answer ends the poll, after waiting out a `Retry-After` of up
+  to 30 seconds.
+- After a failed poll the window is kept, so the next poll still covers the
+  jobs the failed one missed, up to 6 hours back.
+- At most 20 pages of 100 jobs are read per project and poll.
 - A runner description that changes shows up as a new `runner` label value.
+
+## Upgrading to 0.2.0
+
+- The `project` label is now the full path with groups (`my-group/my-project`),
+  not the last path segment. Existing series are replaced by new ones, so
+  update queries and alerts that match on `project`.
+- `GITLAB_URL` must be `https` unless `ALLOW_INSECURE_HTTP=true`, `INTERVAL`
+  must be at least `10s` and the token file must not be empty.
 
 ## Build and test
 

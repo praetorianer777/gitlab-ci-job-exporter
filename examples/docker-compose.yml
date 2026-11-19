@@ -1,7 +1,11 @@
 services:
   gitlab-ci-job-exporter:
-    image: ghcr.io/praetorianer777/gitlab-ci-job-exporter:latest
+    image: ghcr.io/praetorianer777/gitlab-ci-job-exporter:v0.2.0
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     environment:
       GITLAB_URL: https://gitlab.example.com
       GITLAB_GROUP: my-group
@@ -9,7 +13,7 @@ services:
       INTERVAL: 2m
       LOOKBACK: 15m
     ports:
-      - "9168:9168"
+      - "127.0.0.1:9168:9168"
     secrets:
       - gitlab_token
 

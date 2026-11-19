@@ -2,13 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func TestSplitNameSeparatesParallelParts(t *testing.T) {
 	for in, want := range map[string][2]string{
@@ -34,7 +43,7 @@ func fakeGitLab(t *testing.T, now time.Time) (*httptest.Server, *int) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		fmt.Fprint(w, `[{"id":69,"path":"my-project","default_branch":"main"}]`)
+		fmt.Fprint(w, `[{"id":69,"path_with_namespace":"my-group/my-project","default_branch":"main"}]`)
 	})
 	mux.HandleFunc("/api/v4/projects/69/jobs", func(w http.ResponseWriter, r *http.Request) {
 		pages++
@@ -43,7 +52,7 @@ func fakeGitLab(t *testing.T, now time.Time) (*httptest.Server, *int) {
 			fmt.Fprintf(w, `[{"id":3,"name":"check-go","status":"success","ref":"main","duration":100,"queued_duration":1,"finished_at":%q}]`, f(3*time.Hour))
 			return
 		}
-		w.Header().Set("Link", fmt.Sprintf(`<%s/api/v4/projects/69/jobs?page=2>; rel="next"`, "http://"+r.Host))
+		w.Header().Set("X-Next-Page", "2")
 		fmt.Fprintf(w, `[
 		  {"id":1,"name":"test-e2e: [1/2]","status":"failed","ref":"refs/merge-requests/7/head","duration":300,"queued_duration":40,"finished_at":%q,"runner":{"description":"shared runner"},"pipeline":{"source":"merge_request_event"}},
 		  {"id":2,"name":"test-e2e: [2/2]","status":"success","ref":"main","duration":200,"queued_duration":20,"finished_at":%q,"runner":{"description":"portable"},"pipeline":{"source":"push"}}
@@ -56,9 +65,9 @@ func TestPollRecordsJobsSinceAndStopsPaging(t *testing.T) {
 	now := time.Now()
 	srv, pages := fakeGitLab(t, now)
 	defer srv.Close()
-	g := gitlab{base: srv.URL, token: "secret", client: srv.Client()}
+	g := gitlab{base: srv.URL, token: "secret", client: newClient()}
 	s := newStore()
-	if err := poll(context.Background(), g, "my-group", now.Add(-10*time.Minute), s); err != nil {
+	if err := poll(context.Background(), g, "my-group", now.Add(-10*time.Minute), s, quiet); err != nil {
 		t.Fatal(err)
 	}
 	if *pages != 2 {
@@ -68,11 +77,11 @@ func TestPollRecordsJobsSinceAndStopsPaging(t *testing.T) {
 	s.write(&b)
 	out := b.String()
 	for _, want := range []string{
-		`ci_job_duration_seconds_count{project="my-project",job="test-e2e",part="1/2",runner="shared runner",status="failed",ref="merge_request"} 1`,
-		`ci_job_duration_seconds_sum{project="my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default"} 200`,
-		`ci_job_queued_seconds_sum{project="my-project",job="test-e2e",part="1/2",runner="shared runner",status="failed",ref="merge_request"} 40`,
-		`ci_job_duration_seconds_bucket{project="my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default",le="180"} 0`,
-		`ci_job_duration_seconds_bucket{project="my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default",le="300"} 1`,
+		`ci_job_duration_seconds_count{project="my-group/my-project",job="test-e2e",part="1/2",runner="shared runner",status="failed",ref="merge_request"} 1`,
+		`ci_job_duration_seconds_sum{project="my-group/my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default"} 200`,
+		`ci_job_queued_seconds_sum{project="my-group/my-project",job="test-e2e",part="1/2",runner="shared runner",status="failed",ref="merge_request"} 40`,
+		`ci_job_duration_seconds_bucket{project="my-group/my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default",le="180"} 0`,
+		`ci_job_duration_seconds_bucket{project="my-group/my-project",job="test-e2e",part="2/2",runner="portable",status="success",ref="default",le="300"} 1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
@@ -83,7 +92,7 @@ func TestPollRecordsJobsSinceAndStopsPaging(t *testing.T) {
 	}
 
 	// A second poll over the same window must not count a job twice.
-	if err := poll(context.Background(), g, "my-group", now.Add(-10*time.Minute), s); err != nil {
+	if err := poll(context.Background(), g, "my-group", now.Add(-10*time.Minute), s, quiet); err != nil {
 		t.Fatal(err)
 	}
 	b.Reset()
@@ -96,9 +105,315 @@ func TestPollRecordsJobsSinceAndStopsPaging(t *testing.T) {
 func TestPollReportsARefusedToken(t *testing.T) {
 	srv, _ := fakeGitLab(t, time.Now())
 	defer srv.Close()
-	g := gitlab{base: srv.URL, token: "wrong", client: srv.Client()}
-	err := poll(context.Background(), g, "my-group", time.Now().Add(-time.Hour), newStore())
+	g := gitlab{base: srv.URL, token: "wrong", client: newClient()}
+	err := poll(context.Background(), g, "my-group", time.Now().Add(-time.Hour), newStore(), quiet)
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Errorf("poll with a refused token = %v, want an error naming 401", err)
+	}
+}
+
+func render(s *store) string {
+	var b strings.Builder
+	s.write(&b)
+	return b.String()
+}
+
+func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+
+func TestRedirectIsNotFollowedAndTokenStaysHome(t *testing.T) {
+	var leaked atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PRIVATE-TOKEN") != "" {
+			leaked.Store(true)
+		}
+		fmt.Fprint(w, `[]`)
+	}))
+	defer other.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/steal", http.StatusFound)
+	}))
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "secret", client: newClient()}
+	err := poll(context.Background(), g, "my-group", time.Now().Add(-time.Hour), newStore(), quiet)
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Errorf("poll behind a redirect = %v, want an error naming 302", err)
+	}
+	if leaked.Load() {
+		t.Error("the token was sent to the redirect target")
+	}
+}
+
+func TestNextPageOnAnotherHostIsIgnored(t *testing.T) {
+	var leaked atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Store(true)
+		fmt.Fprint(w, `[]`)
+	}))
+	defer other.Close()
+	var pages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		w.Header().Set("Link", fmt.Sprintf(`<%s/api/v4/groups/g/projects?page=2>; rel="next"`, other.URL))
+		fmt.Fprint(w, `[]`)
+	}))
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "secret", client: newClient()}
+	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil {
+		t.Fatal(err)
+	}
+	if leaked.Load() || pages.Load() != 1 {
+		t.Errorf("a Link header to another host was followed (leaked=%v, requests=%d)", leaked.Load(), pages.Load())
+	}
+}
+
+func TestNextPageStaysOnTheConfiguredBase(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Query().Get("page"))
+		if r.URL.Query().Get("page") == "" {
+			w.Header().Set("X-Next-Page", "2")
+		}
+		fmt.Fprint(w, `[{"id":1}]`)
+	}))
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	items, _, err := get[project](context.Background(), g, "x?per_page=1", 5, nil)
+	if err != nil || len(items) != 2 || strings.Join(got, ",") != ",2" {
+		t.Errorf("items=%d pages=%q err=%v, want 2 items from pages 1 and 2", len(items), got, err)
+	}
+}
+
+func TestPagingStopsOnOldJobDespiteNullFinishedAt(t *testing.T) {
+	now := time.Now()
+	var pages atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p","default_branch":"main"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		w.Header().Set("X-Next-Page", "9")
+		fmt.Fprintf(w, `[{"id":1,"name":"a","status":"canceled","finished_at":null,"created_at":%q},
+		  {"id":2,"name":"b","status":"success","finished_at":%q,"created_at":%q,"duration":5}]`,
+			stamp(now.Add(-time.Minute)), stamp(now.Add(-2*time.Hour)), stamp(now.Add(-3*time.Hour)))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	if err := poll(context.Background(), g, "g", now.Add(-time.Hour), newStore(), quiet); err != nil {
+		t.Fatal(err)
+	}
+	if pages.Load() != 1 {
+		t.Errorf("read %d pages, want 1: an old job on the page ends paging", pages.Load())
+	}
+}
+
+func TestPageCapIsCountedAndPagingEnds(t *testing.T) {
+	now := time.Now()
+	var pages atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p","default_branch":"main"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		w.Header().Set("X-Next-Page", "2")
+		fmt.Fprintf(w, `[{"id":%d,"name":"a","status":"success","finished_at":%q,"duration":5}]`, pages.Load(), stamp(now))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", now.Add(-time.Hour), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if pages.Load() != maxJobPages || s.pageCapHits != 1 {
+		t.Errorf("pages=%d hits=%v, want %d pages and 1 hit", pages.Load(), s.pageCapHits, maxJobPages)
+	}
+}
+
+func TestFailedPollKeepsSinceAndWindowIsCapped(t *testing.T) {
+	now := time.Now()
+	if got := windowStart(now.Add(-48*time.Hour), now); !got.Equal(now.Add(-maxWindow)) {
+		t.Errorf("windowStart after a long outage = %v, want now-%s", got, maxWindow)
+	}
+	since := now.Add(-time.Hour)
+	if got := advance(since, now, 2*time.Minute, errors.New("boom")); !got.Equal(since) {
+		t.Errorf("a failed poll moved since to %v", got)
+	}
+	if got := advance(since, now, 2*time.Minute, nil); !got.Equal(now.Add(-2 * time.Minute)) {
+		t.Errorf("a good poll set since to %v", got)
+	}
+	recent := now.Add(-time.Minute)
+	if got := windowStart(recent, now); !got.Equal(recent) {
+		t.Errorf("windowStart moved a recent since to %v", got)
+	}
+}
+
+func TestProjectLabelIsPathWithNamespace(t *testing.T) {
+	now := time.Now()
+	srv, _ := fakeGitLab(t, now)
+	defer srv.Close()
+	s := newStore()
+	g := gitlab{base: srv.URL, token: "secret", client: newClient()}
+	if err := poll(context.Background(), g, "my-group", now.Add(-10*time.Minute), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(render(s), `project="my-group/my-project"`) {
+		t.Errorf("no series labeled with path_with_namespace:\n%s", render(s))
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	dir := t.TempDir()
+	var n int
+	write := func(content string) string {
+		n++
+		p := filepath.Join(dir, fmt.Sprintf("token%d", n))
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	base := map[string]string{"GITLAB_URL": "https://gitlab.example.com", "GITLAB_GROUP": "g", "GITLAB_TOKEN_FILE": write("tok\n")}
+	for name, tc := range map[string]struct {
+		set  map[string]string
+		fail string
+	}{
+		"valid":              {nil, ""},
+		"interval too short": {map[string]string{"INTERVAL": "5s"}, "INTERVAL"},
+		"lookback zero":      {map[string]string{"LOOKBACK": "0s"}, "LOOKBACK"},
+		"lookback negative":  {map[string]string{"LOOKBACK": "-1m"}, "LOOKBACK"},
+		"http refused":       {map[string]string{"GITLAB_URL": "http://gitlab.example.com"}, "ALLOW_INSECURE_HTTP"},
+		"http allowed":       {map[string]string{"GITLAB_URL": "http://gitlab.example.com", "ALLOW_INSECURE_HTTP": "true"}, ""},
+		"other scheme":       {map[string]string{"GITLAB_URL": "ftp://gitlab.example.com"}, "https"},
+		"empty token":        {map[string]string{"GITLAB_TOKEN_FILE": write(" \n")}, "empty"},
+		"control char":       {map[string]string{"GITLAB_TOKEN_FILE": write("ab\x00cd")}, "control character"},
+		"inner newline":      {map[string]string{"GITLAB_TOKEN_FILE": write("ab\ncd")}, "control character"},
+		"bad ttl":            {map[string]string{"SERIES_TTL": "0s"}, "SERIES_TTL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, k := range []string{"GITLAB_URL", "GITLAB_GROUP", "GITLAB_TOKEN_FILE", "INTERVAL", "LOOKBACK", "ALLOW_INSECURE_HTTP", "SERIES_TTL"} {
+				t.Setenv(k, "")
+			}
+			for k, v := range base {
+				t.Setenv(k, v)
+			}
+			for k, v := range tc.set {
+				t.Setenv(k, v)
+			}
+			_, err := loadConfig()
+			switch {
+			case tc.fail == "" && err != nil:
+				t.Errorf("loadConfig = %v, want success", err)
+			case tc.fail != "" && (err == nil || !strings.Contains(err.Error(), tc.fail)):
+				t.Errorf("loadConfig = %v, want an error mentioning %q", err, tc.fail)
+			}
+		})
+	}
+}
+
+func TestLabelEscapingSurvivesInvalidUTF8(t *testing.T) {
+	l := label(key{job: "a\xffb\"c\\d\ne"})
+	if want := "job=\"a\uFFFDb\\\"c\\\\d\\ne\""; !strings.Contains(l, want) {
+		t.Errorf("label = %s, want it to contain %s", l, want)
+	}
+	if !utf8.ValidString(l) {
+		t.Errorf("label is not valid UTF-8: %q", l)
+	}
+}
+
+func TestNullDurationsAreSkipped(t *testing.T) {
+	s := newStore()
+	d := 12.0
+	s.add("g/p", job{ID: 1, Name: "a", Status: "success", FinishedAt: stamp(time.Now()), Duration: &d}, "main")
+	out := render(s)
+	if !strings.Contains(out, `ci_job_duration_seconds_count{project="g/p",job="a"`) {
+		t.Errorf("duration missing:\n%s", out)
+	}
+	if strings.Contains(out, `ci_job_queued_seconds_count{`) {
+		t.Errorf("a null queued_duration was recorded as an observation:\n%s", out)
+	}
+}
+
+func TestTooManyRequestsIsRetriedOnceWhenShort(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, `[]`)
+	}))
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil || calls.Load() != 2 {
+		t.Errorf("err=%v calls=%d, want success after one retry", err, calls.Load())
+	}
+}
+
+func TestTooManyRequestsWithLongWaitAbortsThePoll(t *testing.T) {
+	var projects atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"},{"id":2,"path_with_namespace":"g/b"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/", func(w http.ResponseWriter, r *http.Request) {
+		projects.Add(1)
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet)
+	if err == nil || !strings.Contains(err.Error(), "429") || projects.Load() != 1 {
+		t.Errorf("err=%v project requests=%d, want a 429 error after the first project", err, projects.Load())
+	}
+}
+
+func TestForbiddenProjectIsSkippedNotAnError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusForbidden)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil || s.projectsSkipped != 1 {
+		t.Errorf("err=%v skipped=%v, want no error and 1 skip", err, s.projectsSkipped)
+	}
+}
+
+func TestIdleSeriesExpireAndZeroPollExportsZero(t *testing.T) {
+	s := newStore()
+	d := 1.0
+	s.add("g/p", job{ID: 1, Name: "a", Status: "success", FinishedAt: stamp(time.Now()), Duration: &d}, "main")
+	s.expire(time.Now().Add(time.Hour), 2*time.Hour)
+	if len(s.duration) != 1 {
+		t.Error("a series within its TTL was dropped")
+	}
+	s.expire(time.Now().Add(3*time.Hour), 2*time.Hour)
+	if len(s.duration) != 0 {
+		t.Error("a series past its TTL was kept")
+	}
+	if !strings.Contains(render(s), "ci_job_exporter_last_poll_timestamp_seconds 0\n") {
+		t.Errorf("a poll that never ran must export 0:\n%s", render(s))
+	}
+}
+
+func TestLongPartIsTruncated(t *testing.T) {
+	s := newStore()
+	d := 1.0
+	s.add("g/p", job{ID: 1, Name: "a: [" + strings.Repeat("x", 500) + "]", Status: "success", FinishedAt: stamp(time.Now()), Duration: &d}, "main")
+	for k := range s.duration {
+		if len(k.part) != maxPartLen {
+			t.Errorf("part has %d bytes, want %d", len(k.part), maxPartLen)
+		}
 	}
 }
