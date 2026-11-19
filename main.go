@@ -38,6 +38,7 @@ const (
 	maxRetryAfter    = 30 * time.Second
 	maxRetries       = 2
 	maxPartLen       = 64
+	maxTagsLen       = 128
 	shutdownTimeout  = 5 * time.Second
 	defaultSeriesTTL = 48 * time.Hour
 )
@@ -155,6 +156,7 @@ type job struct {
 	Duration       *float64 `json:"duration"`
 	QueuedDuration *float64 `json:"queued_duration"`
 	CreatedAt      string   `json:"created_at"`
+	TagList        []string `json:"tag_list"`
 	FinishedAt     string   `json:"finished_at"`
 	Runner         *struct {
 		Description string `json:"description"`
@@ -287,8 +289,17 @@ func (h *histogram) observe(v float64, now time.Time) {
 
 type key struct{ project, job, part, runner, status, ref string }
 
+type pendingKey struct{ project, tags string }
+
+type pendingStat struct {
+	count  int
+	oldest time.Time
+}
+
 type store struct {
 	mu              sync.Mutex
+	now             func() time.Time
+	pending         map[pendingKey]*pendingStat
 	duration        map[key]*histogram
 	queued          map[key]*histogram
 	seen            map[int]time.Time
@@ -300,7 +311,27 @@ type store struct {
 }
 
 func newStore() *store {
-	return &store{duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{}}
+	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{}}
+}
+
+// tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
+func tagsLabel(tags []string) string {
+	sorted := append([]string(nil), tags...)
+	sort.Strings(sorted)
+	return truncateRunes(strings.Join(sorted, ","), maxTagsLen)
+}
+
+func addPending(snap map[pendingKey]*pendingStat, projectPath string, j job) {
+	k := pendingKey{projectPath, tagsLabel(j.TagList)}
+	st := snap[k]
+	if st == nil {
+		st = &pendingStat{}
+		snap[k] = st
+	}
+	st.count++
+	if t, err := time.Parse(time.RFC3339, j.CreatedAt); err == nil && (st.oldest.IsZero() || t.Before(st.oldest)) {
+		st.oldest = t
+	}
 }
 
 var parallelPart = regexp.MustCompile(`^(.*?)(?::\s*\[(.*)\]|\s+(\d+/\d+))$`)
@@ -431,17 +462,13 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		return false
 	}
 	var errs []error
+	snapshot := map[pendingKey]*pendingStat{}
 	for _, p := range projects {
 		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
-		switch {
-		case isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound }):
-			log.Debug("skipping a project GitLab will not show", "project", p.PathWithNamespace, "err", err)
-			s.count(&s.projectsSkipped)
-			continue
-		case isStatus(err, func(c int) bool { return c == http.StatusTooManyRequests || c >= 500 }):
-			return errors.Join(append(errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))...)
-		case err != nil:
-			errs = append(errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))
+		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
 			continue
 		}
 		if capped {
@@ -453,8 +480,44 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 				s.add(p.PathWithNamespace, j, p.DefaultBranch)
 			}
 		}
+		waiting, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=pending&per_page=100", p.ID), maxJobPages, nil)
+		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
+			continue
+		}
+		if capped {
+			log.Warn("stopped paging a project's pending jobs at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+			s.count(&s.pageCapHits)
+		}
+		for _, j := range waiting {
+			addPending(snapshot, p.PathWithNamespace, j)
+		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.pending = snapshot
+	s.mu.Unlock()
+	return nil
+}
+
+// classify sorts a failed project read: skip it, end the poll (fatal), or remember the error and go on.
+func classify(err error, p project, s *store, log *slog.Logger, errs *[]error) (skip bool, fatal error) {
+	switch {
+	case err == nil:
+		return false, nil
+	case isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound }):
+		log.Debug("skipping a project GitLab will not show", "project", p.PathWithNamespace, "err", err)
+		s.count(&s.projectsSkipped)
+		return true, nil
+	case isStatus(err, func(c int) bool { return c == http.StatusTooManyRequests || c >= 500 }):
+		return true, errors.Join(append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))...)
+	}
+	*errs = append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))
+	return true, nil
 }
 
 var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
@@ -465,9 +528,35 @@ func label(k key) string {
 		esc(k.project), esc(k.job), esc(k.part), esc(k.runner), esc(k.status), esc(k.ref))
 }
 
+func (s *store) writePending(w *strings.Builder) {
+	keys := make([]pendingKey, 0, len(s.pending))
+	for k := range s.pending {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].project != keys[j].project {
+			return keys[i].project < keys[j].project
+		}
+		return keys[i].tags < keys[j].tags
+	})
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	now := s.now()
+	fmt.Fprint(w, "# HELP ci_jobs_pending Jobs waiting for a runner at the last good poll.\n# TYPE ci_jobs_pending gauge\n")
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_jobs_pending{project=\"%s\",tags=\"%s\"} %d\n", esc(k.project), esc(k.tags), s.pending[k].count)
+	}
+	fmt.Fprint(w, "# HELP ci_job_pending_oldest_seconds Age of the oldest job waiting for a runner, counted from its creation, at scrape time.\n# TYPE ci_job_pending_oldest_seconds gauge\n")
+	for _, k := range keys {
+		if st := s.pending[k]; !st.oldest.IsZero() {
+			fmt.Fprintf(w, "ci_job_pending_oldest_seconds{project=\"%s\",tags=\"%s\"} %g\n", esc(k.project), esc(k.tags), max(0, now.Sub(st.oldest).Seconds()))
+		}
+	}
+}
+
 func (s *store) write(w *strings.Builder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.writePending(w)
 	for _, m := range []struct {
 		name, help string
 		h          map[key]*histogram

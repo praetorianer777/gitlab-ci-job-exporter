@@ -46,6 +46,10 @@ func fakeGitLab(t *testing.T, now time.Time) (*httptest.Server, *int) {
 		fmt.Fprint(w, `[{"id":69,"path_with_namespace":"my-group/my-project","default_branch":"main"}]`)
 	})
 	mux.HandleFunc("/api/v4/projects/69/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") == "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
 		pages++
 		f := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
 		if r.URL.Query().Get("page") == "2" {
@@ -191,6 +195,10 @@ func TestPagingStopsOnOldJobDespiteNullFinishedAt(t *testing.T) {
 		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p","default_branch":"main"}]`)
 	})
 	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") == "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
 		pages.Add(1)
 		w.Header().Set("X-Next-Page", "9")
 		fmt.Fprintf(w, `[{"id":1,"name":"a","status":"canceled","finished_at":null,"created_at":%q},
@@ -216,6 +224,10 @@ func TestPageCapIsCountedAndPagingEnds(t *testing.T) {
 		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p","default_branch":"main"}]`)
 	})
 	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") == "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
 		pages.Add(1)
 		w.Header().Set("X-Next-Page", "2")
 		fmt.Fprintf(w, `[{"id":%d,"name":"a","status":"success","finished_at":%q,"duration":5}]`, pages.Load(), stamp(now))
@@ -415,5 +427,153 @@ func TestLongPartIsTruncated(t *testing.T) {
 		if len(k.part) != maxPartLen {
 			t.Errorf("part has %d bytes, want %d", len(k.part), maxPartLen)
 		}
+	}
+}
+
+// pendingGitLab serves one project whose pending jobs a test can change or break.
+func pendingGitLab(t *testing.T, body *atomic.Value, status *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") != "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		if c := status.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		fmt.Fprint(w, body.Load().(string))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestPendingJobsAreCountedPerProjectAndSortedTags(t *testing.T) {
+	var body atomic.Value
+	var status atomic.Int32
+	now := time.Now().Truncate(time.Second)
+	body.Store(fmt.Sprintf(`[
+	  {"id":1,"tag_list":["light","heavy"],"created_at":%q},
+	  {"id":2,"tag_list":["heavy","light"],"created_at":%q},
+	  {"id":3,"tag_list":["heavy"],"created_at":%q},
+	  {"id":4,"tag_list":[],"created_at":%q}
+	]`, stamp(now.Add(-10*time.Minute)), stamp(now.Add(-90*time.Second)), stamp(now.Add(-30*time.Second)), stamp(now.Add(-5*time.Second))))
+	srv := pendingGitLab(t, &body, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	s.now = func() time.Time { return now }
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_jobs_pending{project="g/a",tags="heavy,light"} 2`,
+		`ci_jobs_pending{project="g/a",tags="heavy"} 1`,
+		`ci_jobs_pending{project="g/a",tags=""} 1`,
+		`ci_job_pending_oldest_seconds{project="g/a",tags="heavy,light"} 600`,
+		`ci_job_pending_oldest_seconds{project="g/a",tags="heavy"} 30`,
+		`ci_job_pending_oldest_seconds{project="g/a",tags=""} 5`,
+	} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+}
+
+func TestPendingSnapshotIsReplacedAndFailedPollKeepsIt(t *testing.T) {
+	var body atomic.Value
+	var status atomic.Int32
+	now := time.Now()
+	body.Store(fmt.Sprintf(`[{"id":1,"tag_list":["heavy"],"created_at":%q}]`, stamp(now)))
+	srv := pendingGitLab(t, &body, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(render(s), `ci_jobs_pending{project="g/a",tags="heavy"} 1`) {
+		t.Fatalf("first snapshot missing:\n%s", render(s))
+	}
+
+	status.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err == nil {
+		t.Fatal("poll with a failing pending read returned no error")
+	}
+	if !strings.Contains(render(s), `ci_jobs_pending{project="g/a",tags="heavy"} 1`) {
+		t.Errorf("a failed poll dropped the last snapshot:\n%s", render(s))
+	}
+
+	status.Store(0)
+	body.Store(`[]`)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `ci_jobs_pending{`) || strings.Contains(out, `ci_job_pending_oldest_seconds{`) {
+		t.Errorf("a project without pending jobs kept its series:\n%s", out)
+	}
+}
+
+func TestForbiddenPendingReadIsSkippedNotAnError(t *testing.T) {
+	var body atomic.Value
+	var status atomic.Int32
+	body.Store(`[]`)
+	status.Store(http.StatusForbidden)
+	srv := pendingGitLab(t, &body, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil || s.projectsSkipped != 1 {
+		t.Errorf("err=%v skipped=%v, want no error and 1 skip", err, s.projectsSkipped)
+	}
+}
+
+func TestPendingTagsAreEscapedAndCapped(t *testing.T) {
+	snap := map[pendingKey]*pendingStat{}
+	addPending(snap, "g/a", job{TagList: []string{"b\"q", strings.Repeat("x", 500)}})
+	s := newStore()
+	s.pending = snap
+	for k := range snap {
+		if utf8.RuneCountInString(k.tags) != maxTagsLen {
+			t.Errorf("tags have %d runes, want %d", utf8.RuneCountInString(k.tags), maxTagsLen)
+		}
+	}
+	s2 := newStore()
+	s2.pending = map[pendingKey]*pendingStat{{"g/a", "q\"\xff"}: {count: 1}}
+	out := render(s2)
+	if !strings.Contains(out, `tags="q\"`+"�"+`"`) || !utf8.ValidString(out) {
+		t.Errorf("tags label not escaped or cleaned:\n%s", out)
+	}
+}
+
+func TestPendingPagingIsCapped(t *testing.T) {
+	var pages atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") != "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		pages.Add(1)
+		w.Header().Set("X-Next-Page", "2")
+		fmt.Fprint(w, `[{"id":1,"tag_list":["a"]}]`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if pages.Load() != maxJobPages || s.pageCapHits != 1 {
+		t.Errorf("pages=%d hits=%v, want %d pages and 1 hit", pages.Load(), s.pageCapHits, maxJobPages)
+	}
+	if !strings.Contains(render(s), `ci_jobs_pending{project="g/p",tags="a"} 20`+"\n") {
+		t.Errorf("pending jobs of capped pages not counted:\n%s", render(s))
 	}
 }

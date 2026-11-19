@@ -266,6 +266,39 @@
         "overrides": []
       },
       "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Waiting jobs by runner tag",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 19,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (tags) (ci_jobs_pending{project=~\"$project\"})",
+          "refId": "A",
+          "legendFormat": "{{tags}}",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "id": 5
     }
   ],
   "templating": {
