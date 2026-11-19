@@ -1,0 +1,5 @@
+/gitlab-ci-job-exporter
+*.test
+*.out
+*.token
+.env

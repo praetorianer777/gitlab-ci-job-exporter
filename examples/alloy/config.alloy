@@ -1,0 +1,18 @@
+prometheus.scrape "ci_job_exporter" {
+  targets = [
+    {"__address__" = "gitlab-ci-job-exporter:9168"},
+  ]
+  scrape_interval = "1m"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "https://mimir.example.com/api/v1/push"
+
+    // Only needed for a multi-tenant Mimir.
+    headers = {
+      "X-Scope-OrgID" = "my-tenant",
+    }
+  }
+}

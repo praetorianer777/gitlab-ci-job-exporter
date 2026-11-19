@@ -1,0 +1,328 @@
+{
+  "title": "CI job durations",
+  "uid": "gitlab-ci-job-exporter",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "refresh": "",
+  "tags": [
+    "ci",
+    "gitlab"
+  ],
+  "panels": [
+    {
+      "type": "table",
+      "title": "Per project and job",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_duration_seconds_sum{project=~\"$project\", runner=~\"$runner\"}[$__range])) / sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__range]))",
+          "refId": "A",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.9, sum by (project, job, le) (increase(ci_job_duration_seconds_bucket{project=~\"$project\", runner=~\"$runner\"}[$__range])))",
+          "refId": "B",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_queued_seconds_sum{project=~\"$project\", runner=~\"$runner\"}[$__range])) / sum by (project, job) (increase(ci_job_queued_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__range]))",
+          "refId": "C",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__range]))",
+          "refId": "D",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\", status=\"failed\"}[$__range])) / sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__range]))",
+          "refId": "E",
+          "legendFormat": "",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "job",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #A": "Average duration",
+              "Value #B": "p90 duration",
+              "Value #C": "Average queue time",
+              "Value #D": "Runs",
+              "Value #E": "Failure rate"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "Average duration|p90 duration|Average queue time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failure rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Runs"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Average duration",
+            "desc": true
+          }
+        ]
+      },
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "Average duration per job",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_duration_seconds_sum{project=~\"$project\", runner=~\"$runner\"}[$__rate_interval])) / sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{project}} / {{job}}",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "id": 2
+    },
+    {
+      "type": "timeseries",
+      "title": "Average queue time per runner",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (runner) (increase(ci_job_queued_seconds_sum{project=~\"$project\", runner=~\"$runner\"}[$__rate_interval])) / sum by (runner) (increase(ci_job_queued_seconds_count{project=~\"$project\", runner=~\"$runner\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{runner}}",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "id": 3
+    },
+    {
+      "type": "timeseries",
+      "title": "Failures per job",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, job) (increase(ci_job_duration_seconds_count{project=~\"$project\", runner=~\"$runner\", status=\"failed\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{project}} / {{job}}",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "id": 4
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "project",
+        "label": "Project",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(ci_job_duration_seconds_count, project)",
+          "refId": "project"
+        },
+        "definition": "label_values(ci_job_duration_seconds_count, project)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "runner",
+        "label": "Runner",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(ci_job_duration_seconds_count{project=~\"$project\"}, runner)",
+          "refId": "runner"
+        },
+        "definition": "label_values(ci_job_duration_seconds_count{project=~\"$project\"}, runner)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  }
+}

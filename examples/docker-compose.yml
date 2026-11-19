@@ -1,0 +1,22 @@
+services:
+  gitlab-ci-job-exporter:
+    image: ghcr.io/praetorianer777/gitlab-ci-job-exporter:latest
+    restart: unless-stopped
+    environment:
+      GITLAB_URL: https://gitlab.example.com
+      GITLAB_GROUP: my-group
+      GITLAB_TOKEN_FILE: /run/secrets/gitlab_token
+      INTERVAL: 2m
+      LOOKBACK: 15m
+    ports:
+      - "9168:9168"
+    secrets:
+      - gitlab_token
+
+# Create the token in GitLab under the group: Settings > Access tokens, role
+# Reporter, scope read_api only. Save it to ./gitlab_token (mode 600) and keep
+# that file out of version control. The container user is 65534, so the file
+# must be readable by it, for example chown 65534 gitlab_token.
+secrets:
+  gitlab_token:
+    file: ./gitlab_token
