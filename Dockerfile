@@ -1,7 +1,8 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+ARG VERSION=dev
 COPY go.mod *.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gitlab-ci-job-exporter .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /gitlab-ci-job-exporter .
 
 FROM scratch
 LABEL org.opencontainers.image.title="gitlab-ci-job-exporter" \
