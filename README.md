@@ -17,6 +17,8 @@ GitLab REST API instead. It is read-only and uses the standard library only.
 | `ci_job_queued_seconds` | histogram | How long a finished job waited for a runner. |
 | `ci_jobs_pending` | gauge | Jobs waiting for a runner, per `project` and `tags`. |
 | `ci_job_pending_oldest_seconds` | gauge | Age of the oldest waiting job per `project` and `tags`: the time since its `created_at`, computed at scrape time. |
+| `ci_pipelines_pending` | gauge | Pipelines with status `pending` (no job has found a runner yet), per `project`. |
+| `ci_pipelines_running` | gauge | Pipelines with status `running`, per `project`. |
 | `ci_job_exporter_build_info` | gauge | Always 1; the `version` label is the release version. |
 | `ci_job_exporter_last_poll_timestamp_seconds` | gauge | When GitLab was last read without error; 0 before the first success. |
 | `ci_job_exporter_last_poll_duration_seconds` | gauge | How long the last finished poll took. |
@@ -42,6 +44,11 @@ good poll replaces the whole set, so a project with no waiting jobs has no
 series; a failed poll keeps the previous set. Age is measured from
 `created_at`, not from GitLab's `queued_duration`, which is only set once a
 runner has taken the job.
+
+The two pipeline gauges carry only `project`. They are read from
+`projects/:id/pipelines?status=pending` and `?status=running` and replaced as a
+whole after each good poll, like the pending jobs: a project with no such
+pipeline has no series, and a failed poll keeps the previous set.
 
 Buckets, in seconds: 30, 60, 120, 180, 300, 450, 600, 900, 1200, 1800, 2700, 3600.
 
@@ -103,7 +110,7 @@ Ready-to-use files are in [`examples/`](examples):
 - [`examples/docker-compose.yml`](examples/docker-compose.yml): the exporter with the token as a Docker secret.
 - [`examples/prometheus.yml`](examples/prometheus.yml): a Prometheus scrape config.
 - [`examples/alloy/config.alloy`](examples/alloy/config.alloy): Grafana Alloy scraping the exporter and writing to a Prometheus or Mimir remote-write URL, with an optional `X-Scope-OrgID` header.
-- [`examples/grafana/dashboard.json`](examples/grafana/dashboard.json): a small Grafana dashboard with a table per project and job (average and p90 duration, average queue time, runs, failure rate) and graphs for duration, queue time per runner, failures and waiting jobs by runner tag. Import it in Grafana and pick the Prometheus data source.
+- [`examples/grafana/dashboard.json`](examples/grafana/dashboard.json): a small Grafana dashboard with a table per project and job (average and p90 duration, average queue time, runs, failure rate) a stat panel with the pipelines waiting, and graphs for duration, queue time per runner, failures and waiting jobs by runner tag. Import it in Grafana and pick the Prometheus data source.
 
 ## Queries
 
@@ -143,6 +150,12 @@ Waiting jobs per runner tag:
 sum by (tags) (ci_jobs_pending)
 ```
 
+Pipelines waiting for a runner, all projects:
+
+```promql
+sum(ci_pipelines_pending)
+```
+
 Longest wait per runner tag:
 
 ```promql
@@ -164,7 +177,7 @@ max by (tags) (ci_job_pending_oldest_seconds)
   to 30 seconds.
 - After a failed poll the window is kept, so the next poll still covers the
   jobs the failed one missed, up to 6 hours back.
-- At most 20 pages of 100 jobs are read per project and poll, for finished and for waiting jobs each.
+- At most 20 pages of 100 jobs are read per project and poll, for finished jobs, waiting jobs and each pipeline status.
 - A runner description that changes shows up as a new `runner` label value.
 
 ## Upgrading to 0.2.0
