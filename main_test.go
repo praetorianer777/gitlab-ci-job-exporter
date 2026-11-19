@@ -45,6 +45,9 @@ func fakeGitLab(t *testing.T, now time.Time) (*httptest.Server, *int) {
 		}
 		fmt.Fprint(w, `[{"id":69,"path_with_namespace":"my-group/my-project","default_branch":"main"}]`)
 	})
+	mux.HandleFunc("/api/v4/projects/69/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[]`)
+	})
 	mux.HandleFunc("/api/v4/projects/69/jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("scope[]") == "pending" {
 			fmt.Fprint(w, `[]`)
@@ -436,6 +439,9 @@ func pendingGitLab(t *testing.T, body *atomic.Value, status *atomic.Int32) *http
 	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
 	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[]`)
+	})
 	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("scope[]") != "pending" {
 			fmt.Fprint(w, `[]`)
@@ -554,6 +560,9 @@ func TestPendingPagingIsCapped(t *testing.T) {
 	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/p"}]`)
 	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[]`)
+	})
 	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("scope[]") != "pending" {
 			fmt.Fprint(w, `[]`)
@@ -575,5 +584,104 @@ func TestPendingPagingIsCapped(t *testing.T) {
 	}
 	if !strings.Contains(render(s), `ci_jobs_pending{project="g/p",tags="a"} 20`+"\n") {
 		t.Errorf("pending jobs of capped pages not counted:\n%s", render(s))
+	}
+}
+
+// pipelinesGitLab serves two projects whose pipelines per status a test can change or break.
+func pipelinesGitLab(t *testing.T, bodies map[string]*atomic.Value, status *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"},{"id":2,"path_with_namespace":"g/b"}]`)
+	})
+	for _, id := range []string{"1", "2"} {
+		mux.HandleFunc("/api/v4/projects/"+id+"/jobs", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `[]`)
+		})
+		mux.HandleFunc("/api/v4/projects/"+id+"/pipelines", func(w http.ResponseWriter, r *http.Request) {
+			if c := status.Load(); c != 0 {
+				http.Error(w, "no", int(c))
+				return
+			}
+			b := bodies[r.URL.Query().Get("status")]
+			if b == nil {
+				http.Error(w, "unexpected status", http.StatusBadRequest)
+				return
+			}
+			if id == "2" {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			fmt.Fprint(w, b.Load().(string))
+		})
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newPipelineBodies(pending, running string) map[string]*atomic.Value {
+	m := map[string]*atomic.Value{"pending": {}, "running": {}}
+	m["pending"].Store(pending)
+	m["running"].Store(running)
+	return m
+}
+
+func TestPipelinesAreCountedPerProjectAndStatus(t *testing.T) {
+	var status atomic.Int32
+	srv := pipelinesGitLab(t, newPipelineBodies(`[{"id":1},{"id":2},{"id":3}]`, `[{"id":4}]`), &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{`ci_pipelines_pending{project="g/a"} 3`, `ci_pipelines_running{project="g/a"} 1`} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `project="g/b"} `) {
+		t.Errorf("a project without pipelines has a series:\n%s", out)
+	}
+}
+
+func TestPipelineSnapshotIsReplacedAndFailedPollKeepsIt(t *testing.T) {
+	var status atomic.Int32
+	bodies := newPipelineBodies(`[{"id":1}]`, `[{"id":2},{"id":3}]`)
+	srv := pipelinesGitLab(t, bodies, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+
+	status.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("poll with a failing pipelines read returned no error")
+	}
+	out := render(s)
+	if !strings.Contains(out, `ci_pipelines_pending{project="g/a"} 1`) || !strings.Contains(out, `ci_pipelines_running{project="g/a"} 2`) {
+		t.Errorf("a failed poll dropped the last snapshot:\n%s", out)
+	}
+
+	status.Store(0)
+	bodies["pending"].Store(`[]`)
+	bodies["running"].Store(`[]`)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `ci_pipelines_pending{`) || strings.Contains(out, `ci_pipelines_running{`) {
+		t.Errorf("a project without pipelines kept its series:\n%s", out)
+	}
+}
+
+func TestForbiddenPipelinesReadIsSkippedNotAnError(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusForbidden)
+	srv := pipelinesGitLab(t, newPipelineBodies(`[]`, `[]`), &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil || s.projectsSkipped != 2 {
+		t.Errorf("err=%v skipped=%v, want no error and 2 skips", err, s.projectsSkipped)
 	}
 }

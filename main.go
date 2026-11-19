@@ -166,6 +166,10 @@ type job struct {
 	} `json:"pipeline"`
 }
 
+type pipeline struct {
+	ID int `json:"id"`
+}
+
 type gitlab struct {
 	base   string
 	token  string
@@ -300,6 +304,7 @@ type store struct {
 	mu              sync.Mutex
 	now             func() time.Time
 	pending         map[pendingKey]*pendingStat
+	pipelines       map[string]map[string]int
 	duration        map[key]*histogram
 	queued          map[key]*histogram
 	seen            map[int]time.Time
@@ -311,7 +316,7 @@ type store struct {
 }
 
 func newStore() *store {
-	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{}}
+	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{}}
 }
 
 // tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
@@ -333,6 +338,10 @@ func addPending(snap map[pendingKey]*pendingStat, projectPath string, j job) {
 		st.oldest = t
 	}
 }
+
+// pipelineStatuses are the pipeline states exported as gauges. Pending means
+// no job of the pipeline has found a runner yet.
+var pipelineStatuses = []string{"pending", "running"}
 
 var parallelPart = regexp.MustCompile(`^(.*?)(?::\s*\[(.*)\]|\s+(\d+/\d+))$`)
 
@@ -463,6 +472,10 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	}
 	var errs []error
 	snapshot := map[pendingKey]*pendingStat{}
+	pipelineSnap := map[string]map[string]int{}
+	for _, st := range pipelineStatuses {
+		pipelineSnap[st] = map[string]int{}
+	}
 	for _, p := range projects {
 		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
@@ -494,12 +507,29 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		for _, j := range waiting {
 			addPending(snapshot, p.PathWithNamespace, j)
 		}
+		for _, st := range pipelineStatuses {
+			ps, capped, err := get[pipeline](ctx, g, fmt.Sprintf("projects/%d/pipelines?status=%s&per_page=100", p.ID, st), maxJobPages, nil)
+			if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+				if fatal != nil {
+					return fatal
+				}
+				break
+			}
+			if capped {
+				log.Warn("stopped paging a project's pipelines at the page limit", "project", p.PathWithNamespace, "status", st, "pages", maxJobPages)
+				s.count(&s.pageCapHits)
+			}
+			if len(ps) > 0 {
+				pipelineSnap[st][p.PathWithNamespace] = len(ps)
+			}
+		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.pending = snapshot
+	s.pipelines = pipelineSnap
 	s.mu.Unlock()
 	return nil
 }
@@ -553,10 +583,26 @@ func (s *store) writePending(w *strings.Builder) {
 	}
 }
 
+func (s *store) writePipelines(w *strings.Builder) {
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	for _, st := range pipelineStatuses {
+		fmt.Fprintf(w, "# HELP ci_pipelines_%s Pipelines with status %s at the last good poll.\n# TYPE ci_pipelines_%s gauge\n", st, st, st)
+		projects := make([]string, 0, len(s.pipelines[st]))
+		for p := range s.pipelines[st] {
+			projects = append(projects, p)
+		}
+		sort.Strings(projects)
+		for _, p := range projects {
+			fmt.Fprintf(w, "ci_pipelines_%s{project=\"%s\"} %d\n", st, esc(p), s.pipelines[st][p])
+		}
+	}
+}
+
 func (s *store) write(w *strings.Builder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writePending(w)
+	s.writePipelines(w)
 	for _, m := range []struct {
 		name, help string
 		h          map[key]*histogram
