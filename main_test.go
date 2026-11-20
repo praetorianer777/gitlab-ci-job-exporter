@@ -602,6 +602,10 @@ func pipelinesGitLab(t *testing.T, bodies map[string]*atomic.Value, status *atom
 				http.Error(w, "no", int(c))
 				return
 			}
+			if r.URL.Query().Get("scope") == "finished" {
+				fmt.Fprint(w, `[]`)
+				return
+			}
 			b := bodies[r.URL.Query().Get("status")]
 			if b == nil {
 				http.Error(w, "unexpected status", http.StatusBadRequest)
@@ -683,5 +687,114 @@ func TestForbiddenPipelinesReadIsSkippedNotAnError(t *testing.T) {
 	s := newStore()
 	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil || s.projectsSkipped != 2 {
 		t.Errorf("err=%v skipped=%v, want no error and 2 skips", err, s.projectsSkipped)
+	}
+}
+
+// finishedGitLab serves one project with a default branch, its finished pipelines and each one's details.
+func finishedGitLab(t *testing.T, list, latest *atomic.Value, details map[string]string, calls *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","default_branch":"main"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case q.Get("scope") != "finished":
+			fmt.Fprint(w, `[]`)
+		case q.Get("ref") == "main":
+			fmt.Fprint(w, latest.Load().(string))
+		case q.Get("updated_after") == "":
+			http.Error(w, "finished pipelines read without a window", http.StatusBadRequest)
+		default:
+			fmt.Fprint(w, list.Load().(string))
+		}
+	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines/{id}", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		d, ok := details[r.PathValue("id")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, d)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestFinishedPipelinesAreTimedOncePerFinish(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var list, latest atomic.Value
+	var calls atomic.Int32
+	list.Store(`[{"id":7},{"id":8},{"id":9}]`)
+	latest.Store(`[{"id":9,"status":"failed"}]`)
+	details := map[string]string{
+		"7": fmt.Sprintf(`{"id":7,"status":"success","ref":"main","source":"push","created_at":%q,"finished_at":%q,"queued_duration":40}`, stamp(now.Add(-20*time.Minute)), stamp(now.Add(-5*time.Minute))),
+		"8": fmt.Sprintf(`{"id":8,"status":"failed","ref":"refs/merge-requests/3/head","source":"merge_request_event","created_at":%q,"finished_at":%q}`, stamp(now.Add(-3*time.Minute)), stamp(now.Add(-time.Minute))),
+		"9": fmt.Sprintf(`{"id":9,"status":"success","ref":"v1.0.0","tag":true,"source":"push","created_at":%q,"finished_at":%q,"queued_duration":5}`, stamp(now.Add(-2*time.Hour)), stamp(now.Add(-90*time.Minute))),
+	}
+	srv := finishedGitLab(t, &list, &latest, details, &calls)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	since := now.Add(-time.Hour)
+	if err := poll(context.Background(), g, "g", since, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_pipeline_duration_seconds_bucket{project="g/a",status="success",ref="default",le="900"} 1`,
+		`ci_pipeline_duration_seconds_bucket{project="g/a",status="success",ref="default",le="600"} 0`,
+		`ci_pipeline_duration_seconds_sum{project="g/a",status="success",ref="default"} 900`,
+		`ci_pipeline_queued_seconds_sum{project="g/a",status="success",ref="default"} 40`,
+		`ci_pipeline_duration_seconds_count{project="g/a",status="failed",ref="merge_request"} 1`,
+		`ci_default_branch_failed{project="g/a"} 1`,
+	} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `ci_pipeline_queued_seconds_count{project="g/a",status="failed",ref="merge_request"}`) {
+		t.Errorf("a pipeline without a queued time has a queued series:\n%s", out)
+	}
+	if strings.Contains(out, `ref="tag"`) {
+		t.Errorf("a pipeline that finished before the window was counted:\n%s", out)
+	}
+
+	if err := poll(context.Background(), g, "g", since, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); !strings.Contains(out, `ci_pipeline_duration_seconds_count{project="g/a",status="success",ref="default"} 1`+"\n") {
+		t.Errorf("a pipeline seen twice was counted twice:\n%s", out)
+	}
+
+	details["7"] = fmt.Sprintf(`{"id":7,"status":"failed","ref":"main","source":"push","created_at":%q,"finished_at":%q}`, stamp(now.Add(-20*time.Minute)), stamp(now))
+	latest.Store(`[{"id":7,"status":"success"}]`)
+	if err := poll(context.Background(), g, "g", since, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out = render(s)
+	if !strings.Contains(out, `ci_pipeline_duration_seconds_count{project="g/a",status="failed",ref="default"} 1`+"\n") {
+		t.Errorf("a retried pipeline that finished again was not counted:\n%s", out)
+	}
+	if !strings.Contains(out, `ci_default_branch_failed{project="g/a"} 0`+"\n") {
+		t.Errorf("the default branch stayed failed after a green pipeline:\n%s", out)
+	}
+}
+
+func TestMissingPipelineDetailIsSkippedNotAnError(t *testing.T) {
+	var list, latest atomic.Value
+	var calls atomic.Int32
+	list.Store(`[{"id":404}]`)
+	latest.Store(`[]`)
+	srv := finishedGitLab(t, &list, &latest, map[string]string{}, &calls)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now().Add(-time.Hour), s, quiet); err != nil {
+		t.Fatalf("a pipeline deleted between list and read failed the poll: %v", err)
+	}
+	if calls.Load() != 1 || strings.Contains(render(s), "ci_default_branch_failed{") {
+		t.Errorf("calls=%d, metrics:\n%s", calls.Load(), render(s))
 	}
 }

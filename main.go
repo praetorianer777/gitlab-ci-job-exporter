@@ -170,6 +170,19 @@ type pipeline struct {
 	ID int `json:"id"`
 }
 
+// finishedPipeline is one finished pipeline as the pipeline endpoint shows it;
+// the list leaves out the times, so each one is read on its own.
+type finishedPipeline struct {
+	ID             int      `json:"id"`
+	Status         string   `json:"status"`
+	Ref            string   `json:"ref"`
+	Source         string   `json:"source"`
+	Tag            bool     `json:"tag"`
+	CreatedAt      string   `json:"created_at"`
+	FinishedAt     string   `json:"finished_at"`
+	QueuedDuration *float64 `json:"queued_duration"`
+}
+
 type gitlab struct {
 	base   string
 	token  string
@@ -270,6 +283,9 @@ func get[T any](ctx context.Context, g gitlab, path string, maxPages int, stop f
 // Buckets in seconds, from a short check to a stack job near its limit.
 var buckets = []float64{30, 60, 120, 180, 300, 450, 600, 900, 1200, 1800, 2700, 3600}
 
+// Pipelines run longer than single jobs: several stages, each waiting for a runner.
+var pipelineBuckets = []float64{60, 180, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200, 10800}
+
 type histogram struct {
 	counts []uint64
 	sum    float64
@@ -278,10 +294,14 @@ type histogram struct {
 }
 
 func (h *histogram) observe(v float64, now time.Time) {
+	h.observeIn(buckets, v, now)
+}
+
+func (h *histogram) observeIn(bounds []float64, v float64, now time.Time) {
 	if h.counts == nil {
-		h.counts = make([]uint64, len(buckets))
+		h.counts = make([]uint64, len(bounds))
 	}
-	for i, b := range buckets {
+	for i, b := range bounds {
 		if v <= b {
 			h.counts[i]++
 		}
@@ -294,6 +314,14 @@ func (h *histogram) observe(v float64, now time.Time) {
 type key struct{ project, job, part, runner, status, ref string }
 
 type pendingKey struct{ project, tags string }
+
+type pipelineKey struct{ project, status, ref string }
+
+// seenPipeline tells a retried pipeline, which finishes again under the same id, from one already counted.
+type seenPipeline struct {
+	id       int
+	finished string
+}
 
 type pendingStat struct {
 	count  int
@@ -308,6 +336,10 @@ type store struct {
 	duration        map[key]*histogram
 	queued          map[key]*histogram
 	seen            map[int]time.Time
+	pipeDuration    map[pipelineKey]*histogram
+	pipeQueued      map[pipelineKey]*histogram
+	pipeSeen        map[seenPipeline]time.Time
+	defaultFailed   map[string]int
 	lastPoll        time.Time
 	lastPollSeconds float64
 	pollError       float64
@@ -316,7 +348,8 @@ type store struct {
 }
 
 func newStore() *store {
-	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{}}
+	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
+		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}}
 }
 
 // tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
@@ -382,13 +415,7 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	if j.Runner != nil && j.Runner.Description != "" {
 		runner = j.Runner.Description
 	}
-	ref := "branch"
-	if j.Ref == defaultRef {
-		ref = "default"
-	} else if strings.HasPrefix(j.Ref, "refs/merge-requests/") || j.Pipeline.Source == "merge_request_event" {
-		ref = "merge_request"
-	}
-	k := key{projectPath, name, part, runner, j.Status, ref}
+	k := key{projectPath, name, part, runner, j.Status, refKind(j.Ref, j.Pipeline.Source, false, defaultRef)}
 	for _, o := range []struct {
 		m map[key]*histogram
 		v *float64
@@ -405,6 +432,50 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	}
 }
 
+// refKind sorts a ref into default, merge_request, tag or branch.
+func refKind(ref, source string, tag bool, defaultRef string) string {
+	switch {
+	case tag:
+		return "tag"
+	case ref == defaultRef:
+		return "default"
+	case strings.HasPrefix(ref, "refs/merge-requests/") || source == "merge_request_event":
+		return "merge_request"
+	}
+	return "branch"
+}
+
+// addPipeline records a finished pipeline once per finish: its time from creation to the end, which is what
+// someone waiting on it sees, and how long it waited before its first job started.
+func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef string) {
+	created, err1 := time.Parse(time.RFC3339, p.CreatedAt)
+	finished, err2 := time.Parse(time.RFC3339, p.FinishedAt)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sk := seenPipeline{p.ID, p.FinishedAt}
+	if _, ok := s.pipeSeen[sk]; ok {
+		return
+	}
+	s.pipeSeen[sk] = finished
+	k := pipelineKey{projectPath, p.Status, refKind(p.Ref, p.Source, p.Tag, defaultRef)}
+	observe := func(m map[pipelineKey]*histogram, v float64) {
+		h := m[k]
+		if h == nil {
+			h = &histogram{}
+			m[k] = h
+		}
+		h.observeIn(pipelineBuckets, v, now)
+	}
+	observe(s.pipeDuration, max(0, finished.Sub(created).Seconds()))
+	if p.QueuedDuration != nil {
+		observe(s.pipeQueued, *p.QueuedDuration)
+	}
+}
+
 // forget drops seen job ids older than the window a poll can return.
 func (s *store) forget(before time.Time) {
 	s.mu.Lock()
@@ -412,6 +483,11 @@ func (s *store) forget(before time.Time) {
 	for id, t := range s.seen {
 		if t.Before(before) {
 			delete(s.seen, id)
+		}
+	}
+	for k, t := range s.pipeSeen {
+		if t.Before(before) {
+			delete(s.pipeSeen, k)
 		}
 	}
 }
@@ -422,6 +498,13 @@ func (s *store) expire(now time.Time, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, m := range []map[key]*histogram{s.duration, s.queued} {
+		for k, h := range m {
+			if now.Sub(h.last) > ttl {
+				delete(m, k)
+			}
+		}
+	}
+	for _, m := range []map[pipelineKey]*histogram{s.pipeDuration, s.pipeQueued} {
 		for k, h := range m {
 			if now.Sub(h.last) > ttl {
 				delete(m, k)
@@ -472,6 +555,7 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	}
 	var errs []error
 	snapshot := map[pendingKey]*pendingStat{}
+	defaultSnap := map[string]int{}
 	pipelineSnap := map[string]map[string]int{}
 	for _, st := range pipelineStatuses {
 		pipelineSnap[st] = map[string]int{}
@@ -507,12 +591,14 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		for _, j := range waiting {
 			addPending(snapshot, p.PathWithNamespace, j)
 		}
+		skipped := false
 		for _, st := range pipelineStatuses {
 			ps, capped, err := get[pipeline](ctx, g, fmt.Sprintf("projects/%d/pipelines?status=%s&per_page=100", p.ID, st), maxJobPages, nil)
 			if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 				if fatal != nil {
 					return fatal
 				}
+				skipped = true
 				break
 			}
 			if capped {
@@ -523,6 +609,12 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 				pipelineSnap[st][p.PathWithNamespace] = len(ps)
 			}
 		}
+		if skipped {
+			continue
+		}
+		if fatal := pollPipelines(ctx, g, p, since, s, log, &errs, defaultSnap); fatal != nil {
+			return fatal
+		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -530,7 +622,56 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	s.mu.Lock()
 	s.pending = snapshot
 	s.pipelines = pipelineSnap
+	s.defaultFailed = defaultSnap
 	s.mu.Unlock()
+	return nil
+}
+
+// pollPipelines records the pipelines that finished since the window start, and whether the
+// newest finished pipeline of the default branch failed.
+func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s *store, log *slog.Logger, errs *[]error, defaultSnap map[string]int) error {
+	list, capped, err := get[pipeline](ctx, g, fmt.Sprintf("projects/%d/pipelines?scope=finished&updated_after=%s&order_by=updated_at&sort=desc&per_page=100",
+		p.ID, url.QueryEscape(since.UTC().Format(time.RFC3339))), maxJobPages, nil)
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return fatal
+	}
+	if capped {
+		log.Warn("stopped paging a project's finished pipelines at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+		s.count(&s.pageCapHits)
+	}
+	for _, item := range list {
+		body, _, err := g.fetch(ctx, fmt.Sprintf("projects/%d/pipelines/%d", p.ID, item.ID))
+		var fp finishedPipeline
+		if err == nil {
+			if err = json.Unmarshal(body, &fp); err != nil {
+				err = fmt.Errorf("pipeline %d: %w", item.ID, err)
+			}
+		}
+		if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, fp.FinishedAt); err == nil && !t.Before(since) {
+			s.addPipeline(p.PathWithNamespace, fp, p.DefaultBranch)
+		}
+	}
+	if p.DefaultBranch == "" {
+		return nil
+	}
+	latest, _, err := get[finishedPipeline](ctx, g, fmt.Sprintf("projects/%d/pipelines?scope=finished&ref=%s&order_by=id&sort=desc&per_page=1",
+		p.ID, url.QueryEscape(p.DefaultBranch)), 1, nil)
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return fatal
+	}
+	if len(latest) > 0 {
+		failed := 0
+		if latest[0].Status == "failed" {
+			failed = 1
+		}
+		defaultSnap[p.PathWithNamespace] = failed
+	}
 	return nil
 }
 
@@ -598,11 +739,51 @@ func (s *store) writePipelines(w *strings.Builder) {
 	}
 }
 
+func pipelineLabel(k pipelineKey) string {
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	return fmt.Sprintf(`project="%s",status="%s",ref="%s"`, esc(k.project), esc(k.status), esc(k.ref))
+}
+
+func (s *store) writeFinishedPipelines(w *strings.Builder) {
+	for _, m := range []struct {
+		name, help string
+		h          map[pipelineKey]*histogram
+	}{
+		{"ci_pipeline_duration_seconds", "How long a finished pipeline took from its creation to its end.", s.pipeDuration},
+		{"ci_pipeline_queued_seconds", "How long a finished pipeline waited before its first job started.", s.pipeQueued},
+	} {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", m.name, m.help, m.name)
+		keys := make([]pipelineKey, 0, len(m.h))
+		for k := range m.h {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return pipelineLabel(keys[i]) < pipelineLabel(keys[j]) })
+		for _, k := range keys {
+			h, l := m.h[k], pipelineLabel(k)
+			for i, b := range pipelineBuckets {
+				fmt.Fprintf(w, "%s_bucket{%s,le=\"%g\"} %d\n", m.name, l, b, h.counts[i])
+			}
+			fmt.Fprintf(w, "%s_bucket{%s,le=\"+Inf\"} %d\n%s_sum{%s} %g\n%s_count{%s} %d\n", m.name, l, h.count, m.name, l, h.sum, m.name, l, h.count)
+		}
+	}
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	fmt.Fprint(w, "# HELP ci_default_branch_failed 1 when the newest finished pipeline of the default branch failed, at the last good poll.\n# TYPE ci_default_branch_failed gauge\n")
+	projects := make([]string, 0, len(s.defaultFailed))
+	for p := range s.defaultFailed {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		fmt.Fprintf(w, "ci_default_branch_failed{project=\"%s\"} %d\n", esc(p), s.defaultFailed[p])
+	}
+}
+
 func (s *store) write(w *strings.Builder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writePending(w)
 	s.writePipelines(w)
+	s.writeFinishedPipelines(w)
 	for _, m := range []struct {
 		name, help string
 		h          map[key]*histogram
