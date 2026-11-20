@@ -19,6 +19,9 @@ GitLab REST API instead. It is read-only and uses the standard library only.
 | `ci_job_pending_oldest_seconds` | gauge | Age of the oldest waiting job per `project` and `tags`: the time since its `created_at`, computed at scrape time. |
 | `ci_pipelines_pending` | gauge | Pipelines with status `pending` (no job has found a runner yet), per `project`. |
 | `ci_pipelines_running` | gauge | Pipelines with status `running`, per `project`. |
+| `ci_pipeline_duration_seconds` | histogram | How long a finished pipeline took from its creation to its end, waiting included: what someone waiting on it sees. |
+| `ci_pipeline_queued_seconds` | histogram | How long a finished pipeline waited before its first job started. |
+| `ci_default_branch_failed` | gauge | 1 when the newest finished pipeline of the project's default branch failed, else 0, per `project`. |
 | `ci_job_exporter_build_info` | gauge | Always 1; the `version` label is the release version. |
 | `ci_job_exporter_last_poll_timestamp_seconds` | gauge | When GitLab was last read without error; 0 before the first success. |
 | `ci_job_exporter_last_poll_duration_seconds` | gauge | How long the last finished poll took. |
@@ -50,7 +53,16 @@ The two pipeline gauges carry only `project`. They are read from
 whole after each good poll, like the pending jobs: a project with no such
 pipeline has no series, and a failed poll keeps the previous set.
 
-Buckets, in seconds: 30, 60, 120, 180, 300, 450, 600, 900, 1200, 1800, 2700, 3600.
+The two pipeline histograms carry `project`, `status` (`success`, `failed`,
+`canceled` or `skipped`) and `ref`, which here can also be `tag`. They are read
+from `projects/:id/pipelines?scope=finished&updated_after=...` and then each
+pipeline on its own, since the list carries no times. A retried pipeline that
+finishes again is counted again, once per finish. `ci_default_branch_failed`
+is replaced after each good poll like the gauges above.
+
+Job buckets, in seconds: 30, 60, 120, 180, 300, 450, 600, 900, 1200, 1800, 2700, 3600.
+
+Pipeline buckets, in seconds: 60, 180, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200, 10800.
 
 ## Configuration
 
@@ -156,6 +168,26 @@ Pipelines waiting for a runner, all projects:
 sum(ci_pipelines_pending)
 ```
 
+90th percentile of the time from push to a finished merge request pipeline:
+
+```promql
+histogram_quantile(0.9, sum by (project, le) (rate(ci_pipeline_duration_seconds_bucket{ref="merge_request"}[1d])))
+```
+
+Share of failed pipelines per project:
+
+```promql
+sum by (project) (rate(ci_pipeline_duration_seconds_count{status="failed"}[1d]))
+/
+sum by (project) (rate(ci_pipeline_duration_seconds_count[1d]))
+```
+
+Default branches that are red, for an alert with a `for` of an hour:
+
+```promql
+ci_default_branch_failed == 1
+```
+
 Longest wait per runner tag:
 
 ```promql
@@ -166,6 +198,9 @@ max by (tags) (ci_job_pending_oldest_seconds)
 
 - It counts only jobs that finish while it runs, plus the jobs that finished
   within `LOOKBACK` before it started. Older history is not imported.
+- Each poll costs, per project, four list reads (finished and waiting jobs,
+  pending and running pipelines), two more for finished pipelines and the
+  default branch, and one read per pipeline that finished since the last poll.
 - The counters live in memory and restart from zero with the process. Use
   `rate` or `increase`, which handle resets.
 - A job that finishes between two polls is seen at the next poll, so the
