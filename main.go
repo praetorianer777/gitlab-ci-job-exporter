@@ -146,6 +146,8 @@ type project struct {
 	ID                int    `json:"id"`
 	PathWithNamespace string `json:"path_with_namespace"`
 	DefaultBranch     string `json:"default_branch"`
+	// A pointer: GitLab leaves the field out when the project has issues disabled.
+	OpenIssues *int `json:"open_issues_count"`
 }
 
 type job struct {
@@ -340,6 +342,8 @@ type store struct {
 	pipeQueued      map[pipelineKey]*histogram
 	pipeSeen        map[seenPipeline]time.Time
 	defaultFailed   map[string]int
+	openIssues      map[string]int
+	openMRs         map[string]int
 	lastPoll        time.Time
 	lastPollSeconds float64
 	pollError       float64
@@ -349,7 +353,7 @@ type store struct {
 
 func newStore() *store {
 	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
-		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}}
+		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{}}
 }
 
 // tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
@@ -556,11 +560,17 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	var errs []error
 	snapshot := map[pendingKey]*pendingStat{}
 	defaultSnap := map[string]int{}
+	issueSnap := map[string]int{}
+	mrSnap := map[string]int{}
 	pipelineSnap := map[string]map[string]int{}
 	for _, st := range pipelineStatuses {
 		pipelineSnap[st] = map[string]int{}
 	}
 	for _, p := range projects {
+		// The count comes with the project list, so a project whose other reads are refused still has one.
+		if p.OpenIssues != nil {
+			issueSnap[p.PathWithNamespace] = *p.OpenIssues
+		}
 		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
@@ -615,6 +625,16 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if fatal := pollPipelines(ctx, g, p, since, s, log, &errs, defaultSnap); fatal != nil {
 			return fatal
 		}
+		n, ok, err := openMergeRequests(ctx, g, p, log)
+		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
+			continue
+		}
+		if ok {
+			mrSnap[p.PathWithNamespace] = n
+		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -623,6 +643,8 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	s.pending = snapshot
 	s.pipelines = pipelineSnap
 	s.defaultFailed = defaultSnap
+	s.openIssues = issueSnap
+	s.openMRs = mrSnap
 	s.mu.Unlock()
 	return nil
 }
@@ -673,6 +695,22 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 		defaultSnap[p.PathWithNamespace] = failed
 	}
 	return nil
+}
+
+// openMergeRequests reads the total from the X-Total header of a one-item page, so a project
+// costs one small read however many merge requests it has. GitLab leaves X-Total out above
+// 10000 items; counting those would take hundreds of pages, so such a project gets no series.
+func openMergeRequests(ctx context.Context, g gitlab, p project, log *slog.Logger) (n int, ok bool, err error) {
+	_, hdr, err := g.fetch(ctx, fmt.Sprintf("projects/%d/merge_requests?state=opened&per_page=1", p.ID))
+	if err != nil {
+		return 0, false, err
+	}
+	n, err = strconv.Atoi(hdr.Get("X-Total"))
+	if err != nil || n < 0 {
+		log.Warn("GitLab sent no total of open merge requests, so the project has no series", "project", p.PathWithNamespace)
+		return 0, false, nil
+	}
+	return n, true, nil
 }
 
 // classify sorts a failed project read: skip it, end the poll (fatal), or remember the error and go on.
@@ -739,6 +777,27 @@ func (s *store) writePipelines(w *strings.Builder) {
 	}
 }
 
+func (s *store) writeOpenCounts(w *strings.Builder) {
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	for _, m := range []struct {
+		name, help string
+		counts     map[string]int
+	}{
+		{"ci_project_open_issues", "Open issues of a project at the last good poll; no series when the project has issues disabled.", s.openIssues},
+		{"ci_project_open_merge_requests", "Open merge requests of a project at the last good poll; no series when GitLab sent no total.", s.openMRs},
+	} {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", m.name, m.help, m.name)
+		projects := make([]string, 0, len(m.counts))
+		for p := range m.counts {
+			projects = append(projects, p)
+		}
+		sort.Strings(projects)
+		for _, p := range projects {
+			fmt.Fprintf(w, "%s{project=\"%s\"} %d\n", m.name, esc(p), m.counts[p])
+		}
+	}
+}
+
 func pipelineLabel(k pipelineKey) string {
 	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 	return fmt.Sprintf(`project="%s",status="%s",ref="%s"`, esc(k.project), esc(k.status), esc(k.ref))
@@ -783,6 +842,7 @@ func (s *store) write(w *strings.Builder) {
 	defer s.mu.Unlock()
 	s.writePending(w)
 	s.writePipelines(w)
+	s.writeOpenCounts(w)
 	s.writeFinishedPipelines(w)
 	for _, m := range []struct {
 		name, help string
