@@ -792,7 +792,7 @@ func isStatus(err error, match func(code int) bool) bool {
 }
 
 func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store, log *slog.Logger) error {
-	projects, capped, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&statistics=true&per_page=100", maxProjectPages, nil)
+	projects, capped, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&per_page=100", maxProjectPages, nil)
 	if err != nil {
 		return err
 	}
@@ -828,8 +828,12 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if p.OpenIssues != nil {
 			issueSnap[p.PathWithNamespace] = *p.OpenIssues
 		}
+		stats, fatal := projectStatistics(ctx, g, p, log, &errs)
+		if fatal != nil {
+			return fatal
+		}
 		for _, sk := range storageKinds {
-			if v, ok := p.Statistics[sk.field]; ok {
+			if v, ok := stats[sk.field]; ok {
 				storageSnap[storageKey{p.PathWithNamespace, sk.kind}] = v
 			}
 		}
@@ -1018,6 +1022,27 @@ type testReport struct {
 			Classname string `json:"classname"`
 		} `json:"test_cases"`
 	} `json:"test_suites"`
+}
+
+// projectStatistics reads the sizes from the project itself: GitLab 19 sends
+// statistics: null in the group's project list even with statistics=true.
+// A refused read only means no storage series, so it never skips the project.
+func projectStatistics(ctx context.Context, g gitlab, p project, log *slog.Logger, errs *[]error) (map[string]float64, error) {
+	if p.Statistics != nil {
+		return p.Statistics, nil
+	}
+	full, err := getJSON[project](ctx, g, fmt.Sprintf("projects/%d?statistics=true", p.ID))
+	switch {
+	case err == nil:
+		return full.Statistics, nil
+	case refused(err):
+		log.Debug("no statistics for a project GitLab will not show them for", "project", p.PathWithNamespace, "err", err)
+		return nil, nil
+	case isStatus(err, func(c int) bool { return c == http.StatusTooManyRequests || c >= 500 }):
+		return nil, errors.Join(append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))...)
+	}
+	*errs = append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))
+	return nil, nil
 }
 
 func getJSON[T any](ctx context.Context, g gitlab, path string) (v T, err error) {

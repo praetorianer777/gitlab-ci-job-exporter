@@ -1280,12 +1280,20 @@ func TestTestSeriesAreCapped(t *testing.T) {
 func groupGitLab(t *testing.T, opened *atomic.Int32, milestoneStatus, statsStatus, issueStatus *atomic.Int32, pages *atomic.Int32) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		// As GitLab 19 does: the list carries statistics: null, only the project itself has the sizes.
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","open_issues_count":4,"statistics":null},
+		  {"id":2,"path_with_namespace":"g/b","open_issues_count":1,"statistics":null},{"id":3,"path_with_namespace":"g/noissues"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("statistics") != "true" {
 			http.Error(w, "statistics not asked for", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","open_issues_count":4,"statistics":{"repository_size":1000,"job_artifacts_size":2500.5,"container_registry_size":7,"commit_count":9}},
-		  {"id":2,"path_with_namespace":"g/b","open_issues_count":1},{"id":3,"path_with_namespace":"g/noissues"}]`)
+		fmt.Fprint(w, `{"id":1,"path_with_namespace":"g/a","statistics":{"repository_size":1000,"job_artifacts_size":2500.5,"container_registry_size":7,"commit_count":9}}`)
+	})
+	mux.HandleFunc("/api/v4/projects/2", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusForbidden) })
+	mux.HandleFunc("/api/v4/projects/3", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":3,"path_with_namespace":"g/noissues"}`)
 	})
 	for _, id := range []string{"1", "2", "3"} {
 		mux.HandleFunc("/api/v4/projects/"+id+"/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })

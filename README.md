@@ -127,9 +127,10 @@ is the `X-Total` header of `projects/:id/issues?state=opened&assignee_id=None`.
 All three are replaced as a whole after each good poll, and a read GitLab
 refuses with 403 or 404 gives no series.
 
-`ci_project_storage_bytes` takes its values from the `statistics` of the
-project list, which GitLab sends only to a token with at least the Reporter
-role. `kind` is `repository`, `wiki`, `lfs`, `job_artifacts`,
+`ci_project_storage_bytes` takes its values from `projects/:id?statistics=true`,
+one read per project, since GitLab 19 sends `statistics: null` in the group's
+project list. GitLab sends them only to a token with at least the Reporter
+role; a refused read gives no storage series and does not skip the project. `kind` is `repository`, `wiki`, `lfs`, `job_artifacts`,
 `pipeline_artifacts`, `packages`, `snippets`, `uploads` or `container_registry`;
 a kind GitLab leaves out has no series, and there is no total, so use
 `sum by (project)`.
@@ -300,8 +301,8 @@ max by (tags) (ci_job_pending_oldest_seconds)
   assignee one small read (none for a project with issues disabled), and each
   newly finished failed pipeline one read of its test report summary and, when
   it has tests, one of the full report. Once per poll the group's active
-  milestones cost one read and one more per milestone. The project list is
-  asked for `statistics=true`, which makes it somewhat heavier for GitLab. The
+  milestones cost one read and one more per milestone. Each project's
+  statistics cost one more small read. The
   open issue count comes with the project list at no extra cost.
 - The counters live in memory and restart from zero with the process. Use
   `rate` or `increase`, which handle resets.
