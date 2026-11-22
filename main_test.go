@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -168,7 +169,7 @@ func TestNextPageOnAnotherHostIsIgnored(t *testing.T) {
 	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil {
 		t.Fatal(err)
 	}
-	if leaked.Load() || pages.Load() != 1 {
+	if leaked.Load() || pages.Load() != 2 {
 		t.Errorf("a Link header to another host was followed (leaked=%v, requests=%d)", leaked.Load(), pages.Load())
 	}
 }
@@ -363,7 +364,7 @@ func TestTooManyRequestsIsRetriedOnceWhenShort(t *testing.T) {
 	}))
 	defer srv.Close()
 	g := gitlab{base: srv.URL, token: "t", client: newClient()}
-	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil || calls.Load() != 2 {
+	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil || calls.Load() != 3 {
 		t.Errorf("err=%v calls=%d, want success after one retry", err, calls.Load())
 	}
 }
@@ -814,13 +815,21 @@ func openCountsGitLab(t *testing.T, issues, mrs *atomic.Int32, status *atomic.In
 				http.Error(w, "no", int(c))
 				return
 			}
-			if q := r.URL.Query(); q.Get("state") != "opened" || q.Get("per_page") != "1" {
+			q := r.URL.Query()
+			if q.Get("state") == "merged" {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			if q.Get("state") != "opened" || q.Get("per_page") != "100" {
 				http.Error(w, "unexpected query", http.StatusBadRequest)
 				return
 			}
-			if id != "3" {
-				w.Header().Set("X-Total", fmt.Sprint(mrs.Load()))
+			if id == "3" {
+				w.Header().Set("X-Next-Page", "2")
+				fmt.Fprint(w, `[{"id":1}]`)
+				return
 			}
+			w.Header().Set("X-Total", fmt.Sprint(mrs.Load()))
 			fmt.Fprint(w, `[]`)
 		})
 	}
@@ -916,5 +925,506 @@ func TestAProjectWhoseJobsAreRefusedStillHasItsIssueCount(t *testing.T) {
 	}
 	if out := render(s); !strings.Contains(out, `ci_project_open_issues{project="g/no-ci"} 4`) {
 		t.Errorf("the issue count of a project without CI is missing:\n%s", out)
+	}
+}
+
+// flowGitLab serves one project whose open and merged merge request lists a test can change or break.
+func flowGitLab(t *testing.T, open, merged *atomic.Value, status *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		if c := status.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		switch r.URL.Query().Get("state") {
+		case "opened":
+			fmt.Fprint(w, open.Load().(string))
+		case "merged":
+			if r.URL.Query().Get("updated_after") == "" {
+				http.Error(w, "no window", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(w, merged.Load().(string))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newFlow(open, merged string) (*atomic.Value, *atomic.Value, *atomic.Int32) {
+	var o, m atomic.Value
+	var st atomic.Int32
+	o.Store(open)
+	m.Store(merged)
+	return &o, &m, &st
+}
+
+func TestMergeRequestFlowIsExported(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	open, merged, status := newFlow(fmt.Sprintf(`[
+	  {"id":1,"created_at":%q,"draft":true,"detailed_merge_status":"draft_status"},
+	  {"id":2,"created_at":%q,"detailed_merge_status":"ci_must_pass"},
+	  {"id":3,"created_at":%q,"detailed_merge_status":"mergeable"},
+	  {"id":4,"created_at":%q,"detailed_merge_status":"mergeable"},
+	  {"id":5,"created_at":%q,"detailed_merge_status":"%s"}]`,
+		stamp(now.Add(-100*time.Hour)), stamp(now.Add(-2*time.Hour)), stamp(now.Add(-time.Hour)), stamp(now.Add(-time.Minute)), stamp(now), strings.Repeat("x", 40)),
+		fmt.Sprintf(`[{"id":10,"created_at":%q,"merged_at":%q},{"id":11,"created_at":%q,"merged_at":%q},{"id":12,"created_at":%q,"merged_at":%q}]`,
+			stamp(now.Add(-3*time.Hour)), stamp(now.Add(-time.Hour)),
+			stamp(now.Add(-30*time.Hour)), stamp(now.Add(-5*time.Minute)),
+			stamp(now.Add(-50*time.Hour)), stamp(now.Add(-20*time.Minute))))
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	s.now = func() time.Time { return now }
+	// Merge request 12 was merged before the window, so a poll that overlaps an earlier one must not count it.
+	since := now.Add(-10 * time.Minute)
+	if err := poll(context.Background(), g, "g", since, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_project_open_merge_requests{project="g/a"} 5` + "\n",
+		`ci_merge_request_oldest_open_seconds{project="g/a"} 7200` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="ci_must_pass"} 1` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="draft_status"} 1` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="mergeable"} 2` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="` + strings.Repeat("x", 32) + `"} 1` + "\n",
+		`ci_merge_request_time_to_merge_seconds_count{project="g/a"} 1` + "\n",
+		`ci_merge_request_time_to_merge_seconds_sum{project="g/a"} 107700` + "\n",
+		`ci_merge_request_time_to_merge_seconds_bucket{project="g/a",le="86400"} 0` + "\n",
+		`ci_merge_request_time_to_merge_seconds_bucket{project="g/a",le="172800"} 1` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+}
+
+func TestMergedMergeRequestIsObservedOncePerId(t *testing.T) {
+	now := time.Now()
+	open, merged, status := newFlow(`[]`, fmt.Sprintf(`[{"id":10,"created_at":%q,"merged_at":%q}]`, stamp(now.Add(-2*time.Hour)), stamp(now.Add(-time.Minute))))
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	for range 2 {
+		if err := poll(context.Background(), g, "g", now.Add(-10*time.Minute), s, quiet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out := render(s); !strings.Contains(out, `ci_merge_request_time_to_merge_seconds_count{project="g/a"} 1`+"\n") {
+		t.Errorf("a merge request seen in two polls was not counted once:\n%s", out)
+	}
+	if out := render(s); strings.Contains(out, "ci_merge_request_oldest_open_seconds{") {
+		t.Errorf("a project without open merge requests has an age series:\n%s", out)
+	}
+}
+
+func TestMergeRequestFlowGaugesSurviveAFailedPollAndAreReplaced(t *testing.T) {
+	now := time.Now()
+	open, merged, status := newFlow(fmt.Sprintf(`[{"id":2,"created_at":%q,"detailed_merge_status":"mergeable"}]`, stamp(now.Add(-time.Hour))), `[]`)
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	s.now = func() time.Time { return now }
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	open.Store(fmt.Sprintf(`[{"id":2,"created_at":%q,"detailed_merge_status":"conflict"}]`, stamp(now.Add(-time.Hour))))
+	status.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err == nil {
+		t.Fatal("a failing read returned no error")
+	}
+	if out := render(s); !strings.Contains(out, `state="mergeable"} 1`) || strings.Contains(out, `state="conflict"`) {
+		t.Errorf("a failed poll changed the state counts:\n%s", out)
+	}
+	status.Store(0)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `state="mergeable"`) || !strings.Contains(out, `state="conflict"} 1`) {
+		t.Errorf("a good poll did not replace the state counts:\n%s", out)
+	}
+}
+
+func TestOpenMergeRequestsAtThePageLimitHaveNoStateCounts(t *testing.T) {
+	var issues, mrs, status atomic.Int32
+	srv := openCountsGitLab(t, &issues, &mrs, &status)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `ci_merge_requests_open_by_state{project="g/huge"`) || s.pageCapHits == 0 {
+		t.Errorf("a capped list has state counts or the cap went uncounted (%v):\n%s", s.pageCapHits, out)
+	}
+}
+
+// retryGitLab serves one project whose finished jobs a test can swap between polls.
+func retryGitLab(t *testing.T, jobs *atomic.Value) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","default_branch":"main"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope[]") == "pending" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		if r.URL.Query().Get("include_retried") != "true" {
+			http.Error(w, "retried jobs not asked for", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, jobs.Load().(string))
+	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func retryJob(id int, name, status string, pipeline int, retried bool, at time.Time) string {
+	return fmt.Sprintf(`{"id":%d,"name":%q,"status":%q,"ref":"feature","duration":60,"finished_at":%q,"retried":%t,"pipeline":{"id":%d}}`, id, name, status, stamp(at), retried, pipeline)
+}
+
+func TestRetriedJobsAreCountedOnceAndKeepTheHistograms(t *testing.T) {
+	now := time.Now()
+	var jobs atomic.Value
+	jobs.Store("[" + strings.Join([]string{
+		retryJob(3, "test: [1/2]", "success", 7, false, now.Add(-time.Minute)),
+		retryJob(2, "test: [1/2]", "failed", 7, false, now.Add(-2*time.Minute)),
+		retryJob(1, "lint", "failed", 7, true, now.Add(-3*time.Minute)),
+	}, ",") + "]")
+	srv := retryGitLab(t, &jobs)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	for range 2 {
+		if err := poll(context.Background(), g, "g", now.Add(-time.Hour), s, quiet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_job_retried_total{project="g/a",job="test",ref="branch"} 1` + "\n",
+		`ci_job_retried_total{project="g/a",job="lint",ref="branch"} 1` + "\n",
+		`ci_job_retry_passed_total{project="g/a",job="test",ref="branch"} 1` + "\n",
+		`ci_job_duration_seconds_count{project="g/a",job="test",part="1/2",runner="none",status="success",ref="branch"} 1` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `job="lint",part`) {
+		t.Errorf("a job marked retried is in the duration histograms:\n%s", out)
+	}
+	if strings.Contains(out, `ci_job_retry_passed_total{project="g/a",job="lint"`) {
+		t.Errorf("a job without a passing retry counts as one that passed:\n%s", out)
+	}
+}
+
+func TestARetryInALaterPollStillCountsTheEarlierRun(t *testing.T) {
+	now := time.Now()
+	var jobs atomic.Value
+	jobs.Store("[" + retryJob(1, "build", "failed", 9, false, now.Add(-5*time.Minute)) + "]")
+	srv := retryGitLab(t, &jobs)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", now.Add(-time.Hour), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, "ci_job_retried_total{") {
+		t.Fatalf("a job nobody retried is counted as retried:\n%s", out)
+	}
+	jobs.Store("[" + retryJob(2, "build", "failed", 9, false, now.Add(-time.Minute)) + "," + retryJob(3, "build", "success", 9, false, now) + "]")
+	if err := poll(context.Background(), g, "g", now.Add(-time.Hour), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{`ci_job_retried_total{project="g/a",job="build",ref="branch"} 2` + "\n", `ci_job_retry_passed_total{project="g/a",job="build",ref="branch"} 1` + "\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+}
+
+func TestIdleRetryCountersExpire(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	bump(s.retried, retryKey{"g/a", "j", "branch"}, now.Add(-3*time.Hour))
+	bump(s.testFailures, testKey{"g/a", "s", "t"}, now.Add(-3*time.Hour))
+	s.expire(now, time.Hour)
+	if len(s.retried) != 0 || len(s.testFailures) != 0 {
+		t.Errorf("series idle for longer than the ttl are kept: %v %v", s.retried, s.testFailures)
+	}
+}
+
+// reportGitLab serves one project with the failed pipelines in details and a test report for each of them.
+func reportGitLab(t *testing.T, now time.Time, summaryStatus int, reportReads *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("scope") == "finished" && r.URL.Query().Get("updated_after") != "" {
+			fmt.Fprint(w, `[{"id":10},{"id":11},{"id":12}]`)
+			return
+		}
+		fmt.Fprint(w, `[]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines/{id}", func(w http.ResponseWriter, r *http.Request) {
+		status := "failed"
+		if r.PathValue("id") == "12" {
+			status = "success"
+		}
+		fmt.Fprintf(w, `{"id":%s,"status":%q,"ref":"x","created_at":%q,"finished_at":%q}`, r.PathValue("id"), status, stamp(now.Add(-time.Minute)), stamp(now))
+	})
+	mux.HandleFunc("/api/v4/projects/1/merge_requests", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/pipelines/{id}/test_report_summary", func(w http.ResponseWriter, r *http.Request) {
+		if summaryStatus != 0 {
+			http.Error(w, "no", summaryStatus)
+			return
+		}
+		count := 3
+		if r.PathValue("id") == "11" {
+			count = 0
+		}
+		fmt.Fprintf(w, `{"total":{"count":%d}}`, count)
+	})
+	mux.HandleFunc("/api/v4/projects/1/pipelines/{id}/test_report", func(w http.ResponseWriter, r *http.Request) {
+		reportReads.Add(1)
+		cases := []string{
+			`{"status":"failed","name":"TestA","classname":"pkg.Suite"}`,
+			`{"status":"success","name":"TestOk","classname":"pkg.Suite"}`,
+			`{"status":"error","name":"TestB"}`,
+		}
+		for i := range 60 {
+			cases = append(cases, fmt.Sprintf(`{"status":"failed","name":"Many%d","classname":"pkg.Many"}`, i))
+		}
+		fmt.Fprintf(w, `{"test_suites":[{"name":%q,"test_cases":[%s]}]}`, strings.Repeat("s", 200), strings.Join(cases, ","))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestFailingTestsAreCountedOncePerFailedPipeline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var reads atomic.Int32
+	srv := reportGitLab(t, now, 0, &reads)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	for range 2 {
+		if err := poll(context.Background(), g, "g", now.Add(-time.Hour), s, quiet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reads.Load() != 1 {
+		t.Errorf("read %d test reports, want 1: one failed pipeline has tests, one has none, one passed, and none is read twice", reads.Load())
+	}
+	out := render(s)
+	suite := strings.Repeat("s", maxLabelLen)
+	for _, want := range []string{
+		`ci_test_failures_total{project="g/a",suite="` + suite + `",test="pkg.Suite.TestA"} 1` + "\n",
+		`ci_test_failures_total{project="g/a",suite="` + suite + `",test="TestB"} 1` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "\nci_test_failures_total{"); n != maxFailedCases {
+		t.Errorf("%d test series from one pipeline, want the cap of %d", n, maxFailedCases)
+	}
+	if strings.Contains(out, "TestOk") {
+		t.Errorf("a passing test case is counted as a failure:\n%s", out)
+	}
+}
+
+func TestForbiddenTestReportIsSkippedNotAnError(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	var reads atomic.Int32
+	srv := reportGitLab(t, now, http.StatusForbidden, &reads)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", now.Add(-time.Hour), s, quiet); err != nil {
+		t.Fatalf("a refused test report ended the poll: %v", err)
+	}
+	if s.projectsSkipped != 1 || reads.Load() != 0 || strings.Contains(render(s), "\nci_test_failures_total{") {
+		t.Errorf("skipped=%v reads=%d, want one skip (the project is not asked again) and no test series", s.projectsSkipped, reads.Load())
+	}
+}
+
+func TestTestSeriesAreCapped(t *testing.T) {
+	s := newStore()
+	for i := range maxTestSeries/maxFailedCases + 5 {
+		var cases []string
+		for j := range maxFailedCases {
+			cases = append(cases, fmt.Sprintf(`{"status":"failed","name":"t%d-%d"}`, i, j))
+		}
+		var r testReport
+		if err := json.Unmarshal([]byte(`{"test_suites":[{"name":"s","test_cases":[`+strings.Join(cases, ",")+`]}]}`), &r); err != nil {
+			t.Fatal(err)
+		}
+		s.addTestFailures("g/a", r)
+	}
+	if len(s.testFailures) != maxTestSeries {
+		t.Errorf("%d test series, want the cap of %d", len(s.testFailures), maxTestSeries)
+	}
+}
+
+// groupGitLab serves two projects, one with storage statistics and one without, and the group's
+// milestones. A test can change the counts or make the milestone, statistics or issue reads fail.
+func groupGitLab(t *testing.T, opened *atomic.Int32, milestoneStatus, statsStatus, issueStatus *atomic.Int32, pages *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		// As GitLab 19 does: the list carries statistics: null, only the project itself has the sizes.
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","open_issues_count":4,"statistics":null},
+		  {"id":2,"path_with_namespace":"g/b","open_issues_count":1,"statistics":null},{"id":3,"path_with_namespace":"g/noissues"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("statistics") != "true" {
+			http.Error(w, "statistics not asked for", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, `{"id":1,"path_with_namespace":"g/a","statistics":{"repository_size":1000,"job_artifacts_size":2500.5,"container_registry_size":7,"commit_count":9}}`)
+	})
+	mux.HandleFunc("/api/v4/projects/2", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusForbidden) })
+	mux.HandleFunc("/api/v4/projects/3", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":3,"path_with_namespace":"g/noissues"}`)
+	})
+	for _, id := range []string{"1", "2", "3"} {
+		mux.HandleFunc("/api/v4/projects/"+id+"/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/merge_requests", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/issues", func(w http.ResponseWriter, r *http.Request) {
+			if c := issueStatus.Load(); c != 0 {
+				http.Error(w, "no", int(c))
+				return
+			}
+			if q := r.URL.Query(); q.Get("state") != "opened" || q.Get("assignee_id") != "None" || q.Get("per_page") != "1" {
+				http.Error(w, "unexpected query", http.StatusBadRequest)
+				return
+			}
+			if id == "1" {
+				w.Header().Set("X-Total", "3")
+			}
+			fmt.Fprint(w, `[]`)
+		})
+	}
+	mux.HandleFunc("/api/v4/groups/g/milestones", func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		if c := milestoneStatus.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		if q := r.URL.Query(); q.Get("state") != "active" || q.Get("per_page") != "100" {
+			http.Error(w, "unexpected query", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Next-Page", "2")
+		fmt.Fprintf(w, `[{"title":"v1.0","due_date":"2026-12-01"},{"title":"later"},{"title":"v1.0","due_date":"2027-01-01"},{"title":%q}]`, strings.Repeat("m", 200))
+	})
+	mux.HandleFunc("/api/v4/groups/g/issues_statistics", func(w http.ResponseWriter, r *http.Request) {
+		if c := statsStatus.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		n := int(opened.Load())
+		if r.URL.Query().Get("milestone") == "later" {
+			n = 0
+		}
+		fmt.Fprintf(w, `{"statistics":{"counts":{"all":%d,"closed":2,"opened":%d}}}`, n+2, n)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestMilestonesUnassignedAndStorageAreExported(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	opened.Store(5)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_milestone_issues{milestone="later",state="opened"} 0` + "\n" + `ci_milestone_issues{milestone="later",state="closed"} 2` + "\n",
+		`ci_milestone_issues{milestone="v1.0",state="opened"} 5` + "\n" + `ci_milestone_issues{milestone="v1.0",state="closed"} 2` + "\n",
+		`ci_milestone_due_timestamp_seconds{milestone="v1.0"} 1796083200` + "\n",
+		`ci_milestone_issues{milestone="` + strings.Repeat("m", maxLabelLen) + `",state="opened"} 5`,
+		`ci_issues_unassigned{project="g/a"} 3` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="repository"} 1000` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="job_artifacts"} 2500.5` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="container_registry"} 7` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, `ci_milestone_issues{milestone="v1.0",state="opened"}`); n != 1 {
+		t.Errorf("a milestone title that occurs twice has %d series", n)
+	}
+	for _, bad := range []string{`ci_milestone_due_timestamp_seconds{milestone="later"}`, `ci_project_storage_bytes{project="g/b"`, `ci_issues_unassigned{project="g/b"}`, `ci_issues_unassigned{project="g/noissues"}`, `kind="commit_count"`} {
+		if strings.Contains(out, bad) {
+			t.Errorf("metrics have a series that should not exist: %s\n%s", bad, out)
+		}
+	}
+	if pages.Load() != 1 {
+		t.Errorf("read %d pages of milestones, want only the first", pages.Load())
+	}
+}
+
+func TestMilestoneAndUnassignedGaugesAreReplacedAndFailedPollKeepsThem(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	opened.Store(5)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	opened.Store(8)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); !strings.Contains(out, `ci_milestone_issues{milestone="v1.0",state="opened"} 8`) {
+		t.Fatalf("a good poll did not replace the milestone counts:\n%s", out)
+	}
+	opened.Store(9)
+	st.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("a failing milestone read returned no error")
+	}
+	st.Store(0)
+	is.Store(http.StatusBadGateway)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("a failing issue read returned no error")
+	}
+	out := render(s)
+	if !strings.Contains(out, `ci_milestone_issues{milestone="v1.0",state="opened"} 8`) || !strings.Contains(out, `ci_issues_unassigned{project="g/a"} 3`) {
+		t.Errorf("a failed poll changed the gauges:\n%s", out)
+	}
+}
+
+func TestForbiddenMilestonesAndIssuesAreSkippedNotAnError(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	ms.Store(http.StatusForbidden)
+	is.Store(http.StatusForbidden)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatalf("refused reads ended the poll: %v", err)
+	}
+	out := render(s)
+	if strings.Contains(out, "\nci_milestone_issues{") || strings.Contains(out, "\nci_issues_unassigned{") || s.projectsSkipped != 2 {
+		t.Errorf("skipped=%v, want 2 (the projects with issues enabled) and no series:\n%s", s.projectsSkipped, out)
+	}
+	if !strings.Contains(out, `ci_project_storage_bytes{project="g/a",kind="repository"} 1000`) {
+		t.Errorf("storage depends on the refused reads:\n%s", out)
 	}
 }

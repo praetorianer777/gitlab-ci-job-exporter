@@ -32,6 +32,11 @@ const (
 	// A long outage must not turn into one huge poll that GitLab has to page through.
 	maxWindow        = 6 * time.Hour
 	maxJobPages      = 20
+	maxMRStateLen    = 32
+	maxLabelLen      = 128
+	maxFailedCases   = 50
+	maxTestSeries    = 2000
+	maxMilestones    = 100
 	maxProjectPages  = 1000
 	maxBodyBytes     = 32 << 20
 	maxDrainBytes    = 1 << 20
@@ -148,6 +153,42 @@ type project struct {
 	DefaultBranch     string `json:"default_branch"`
 	// A pointer: GitLab leaves the field out when the project has issues disabled.
 	OpenIssues *int `json:"open_issues_count"`
+	// Only sent with statistics=true and a token that may read them; sizes are in bytes.
+	Statistics map[string]float64 `json:"statistics"`
+}
+
+// storageKinds maps the statistics fields to the kind label of ci_project_storage_bytes.
+var storageKinds = []struct{ kind, field string }{
+	{"repository", "repository_size"},
+	{"wiki", "wiki_size"},
+	{"lfs", "lfs_objects_size"},
+	{"job_artifacts", "job_artifacts_size"},
+	{"pipeline_artifacts", "pipeline_artifacts_size"},
+	{"packages", "packages_size"},
+	{"snippets", "snippets_size"},
+	{"uploads", "uploads_size"},
+	{"container_registry", "container_registry_size"},
+}
+
+type storageKey struct{ project, kind string }
+
+type milestone struct {
+	Title   string `json:"title"`
+	DueDate string `json:"due_date"`
+}
+
+type issueStatistics struct {
+	Statistics struct {
+		Counts struct {
+			Opened int `json:"opened"`
+			Closed int `json:"closed"`
+		} `json:"counts"`
+	} `json:"statistics"`
+}
+
+type milestoneStat struct {
+	opened, closed int
+	due            time.Time
 }
 
 type job struct {
@@ -160,10 +201,13 @@ type job struct {
 	CreatedAt      string   `json:"created_at"`
 	TagList        []string `json:"tag_list"`
 	FinishedAt     string   `json:"finished_at"`
-	Runner         *struct {
+	// Retried is set by GitLab versions that mark a job replaced by a retry; the others leave it out.
+	Retried bool `json:"retried"`
+	Runner  *struct {
 		Description string `json:"description"`
 	} `json:"runner"`
 	Pipeline struct {
+		ID     int    `json:"id"`
 		Source string `json:"source"`
 	} `json:"pipeline"`
 }
@@ -171,6 +215,18 @@ type job struct {
 type pipeline struct {
 	ID int `json:"id"`
 }
+
+// mergeRequest is one item of a merge request list. GitLab 15 and later send draft
+// and detailed_merge_status; an older GitLab sends neither, so its states read "unknown".
+type mergeRequest struct {
+	ID        int    `json:"id"`
+	CreatedAt string `json:"created_at"`
+	MergedAt  string `json:"merged_at"`
+	Draft     bool   `json:"draft"`
+	Status    string `json:"detailed_merge_status"`
+}
+
+func (m mergeRequest) isDraft() bool { return m.Draft || m.Status == "draft_status" }
 
 // finishedPipeline is one finished pipeline as the pipeline endpoint shows it;
 // the list leaves out the times, so each one is read on its own.
@@ -257,26 +313,35 @@ func (g gitlab) fetch(ctx context.Context, path string) ([]byte, http.Header, er
 // is reached. The next page is built from X-Next-Page against the configured
 // base, never from a URL the server sent, so the token stays on that host.
 func get[T any](ctx context.Context, g gitlab, path string, maxPages int, stop func([]T) bool) (all []T, capped bool, err error) {
+	all, capped, _, err = getPages(ctx, g, path, maxPages, stop)
+	return all, capped, err
+}
+
+// getPages is get that also returns the headers of the first page, which carry the totals.
+func getPages[T any](ctx context.Context, g gitlab, path string, maxPages int, stop func([]T) bool) (all []T, capped bool, first http.Header, err error) {
 	next := path
 	for page := 1; ; page++ {
 		body, hdr, err := g.fetch(ctx, next)
 		if err != nil {
-			return nil, false, err
+			return nil, false, nil, err
+		}
+		if page == 1 {
+			first = hdr
 		}
 		var items []T
 		if err := json.Unmarshal(body, &items); err != nil {
-			return nil, false, fmt.Errorf("GET %s: %w", path, err)
+			return nil, false, nil, fmt.Errorf("GET %s: %w", path, err)
 		}
 		all = append(all, items...)
 		if stop != nil && stop(items) {
-			return all, false, nil
+			return all, false, first, nil
 		}
 		np, err := strconv.Atoi(hdr.Get("X-Next-Page"))
 		if err != nil || np <= 0 {
-			return all, false, nil
+			return all, false, first, nil
 		}
 		if page >= maxPages {
-			return all, true, nil
+			return all, true, first, nil
 		}
 		next = path + "&page=" + strconv.Itoa(np)
 	}
@@ -287,6 +352,9 @@ var buckets = []float64{30, 60, 120, 180, 300, 450, 600, 900, 1200, 1800, 2700, 
 
 // Pipelines run longer than single jobs: several stages, each waiting for a runner.
 var pipelineBuckets = []float64{60, 180, 300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200, 10800}
+
+// Merge requests wait for review: from ten minutes to two weeks.
+var mergeBuckets = []float64{600, 1800, 3600, 7200, 14400, 28800, 43200, 86400, 172800, 345600, 604800, 1209600}
 
 type histogram struct {
 	counts []uint64
@@ -325,6 +393,42 @@ type seenPipeline struct {
 	finished string
 }
 
+type retryKey struct{ project, job, ref string }
+
+type testKey struct{ project, suite, test string }
+
+// counter is a monotonic count that expires with its series.
+type counter struct {
+	n    float64
+	last time.Time
+}
+
+func bump[K comparable](m map[K]*counter, k K, now time.Time) {
+	c := m[k]
+	if c == nil {
+		c = &counter{}
+		m[k] = c
+	}
+	c.n++
+	c.last = now
+}
+
+// attemptKey names one job of one pipeline: a retry runs under the same pipeline id and name.
+type attemptKey struct {
+	pipeline int
+	name     string
+}
+
+// attempt is the newest run of a job seen so far, with what is needed to count it once a newer one shows up.
+type attempt struct {
+	id           int
+	status       string
+	rk           retryKey
+	finished     time.Time
+	failedBefore bool
+	passed       bool
+}
+
 type pendingStat struct {
 	count  int
 	oldest time.Time
@@ -344,6 +448,18 @@ type store struct {
 	defaultFailed   map[string]int
 	openIssues      map[string]int
 	openMRs         map[string]int
+	mrOldest        map[string]time.Time
+	mrStates        map[string]map[string]int
+	mrMerge         map[string]*histogram
+	mrSeen          map[int]time.Time
+	unassigned      map[string]int
+	storage         map[storageKey]float64
+	milestones      map[string]milestoneStat
+	retried         map[retryKey]*counter
+	retryPassed     map[retryKey]*counter
+	retriedSeen     map[int]time.Time
+	attempts        map[attemptKey]*attempt
+	testFailures    map[testKey]*counter
 	lastPoll        time.Time
 	lastPollSeconds float64
 	pollError       float64
@@ -353,7 +469,10 @@ type store struct {
 
 func newStore() *store {
 	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
-		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{}}
+		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{},
+		mrOldest: map[string]time.Time{}, mrStates: map[string]map[string]int{}, mrMerge: map[string]*histogram{}, mrSeen: map[int]time.Time{},
+		unassigned: map[string]int{}, storage: map[storageKey]float64{}, milestones: map[string]milestoneStat{},
+		retried: map[retryKey]*counter{}, retryPassed: map[retryKey]*counter{}, retriedSeen: map[int]time.Time{}, attempts: map[attemptKey]*attempt{}, testFailures: map[testKey]*counter{}}
 }
 
 // tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
@@ -419,7 +538,17 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	if j.Runner != nil && j.Runner.Description != "" {
 		runner = j.Runner.Description
 	}
-	k := key{projectPath, name, part, runner, j.Status, refKind(j.Ref, j.Pipeline.Source, false, defaultRef)}
+	ref := refKind(j.Ref, j.Pipeline.Source, false, defaultRef)
+	rk := retryKey{projectPath, name, ref}
+	if j.Retried {
+		s.markRetried(j.ID, rk, finished, now)
+	}
+	s.trackAttempt(j, rk, finished, now)
+	// The histograms keep their meaning: only the run that was not replaced by a retry.
+	if j.Retried {
+		return
+	}
+	k := key{projectPath, name, part, runner, j.Status, ref}
 	for _, o := range []struct {
 		m map[key]*histogram
 		v *float64
@@ -433,6 +562,40 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 			o.m[k] = h
 		}
 		h.observe(*o.v, now)
+	}
+}
+
+func (s *store) markRetried(id int, rk retryKey, finished, now time.Time) {
+	if _, ok := s.retriedSeen[id]; ok {
+		return
+	}
+	s.retriedSeen[id] = finished
+	bump(s.retried, rk, now)
+}
+
+// trackAttempt finds retries by comparing runs of the same job in the same pipeline, since the
+// older run is not necessarily marked and may have been read in an earlier poll. The caller holds the lock.
+func (s *store) trackAttempt(j job, rk retryKey, finished, now time.Time) {
+	if j.Pipeline.ID == 0 {
+		return
+	}
+	ak := attemptKey{j.Pipeline.ID, j.Name}
+	a := s.attempts[ak]
+	if a == nil {
+		s.attempts[ak] = &attempt{id: j.ID, status: j.Status, rk: rk, finished: finished}
+		return
+	}
+	if j.ID < a.id {
+		s.markRetried(j.ID, rk, finished, now)
+		a.failedBefore = a.failedBefore || j.Status == "failed"
+	} else {
+		s.markRetried(a.id, a.rk, a.finished, now)
+		a.failedBefore = a.failedBefore || a.status == "failed"
+		a.id, a.status, a.rk, a.finished = j.ID, j.Status, rk, finished
+	}
+	if a.status == "success" && a.failedBefore && !a.passed {
+		a.passed = true
+		bump(s.retryPassed, a.rk, now)
 	}
 }
 
@@ -451,18 +614,18 @@ func refKind(ref, source string, tag bool, defaultRef string) string {
 
 // addPipeline records a finished pipeline once per finish: its time from creation to the end, which is what
 // someone waiting on it sees, and how long it waited before its first job started.
-func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef string) {
+func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef string) (added bool) {
 	created, err1 := time.Parse(time.RFC3339, p.CreatedAt)
 	finished, err2 := time.Parse(time.RFC3339, p.FinishedAt)
 	if err1 != nil || err2 != nil {
-		return
+		return false
 	}
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sk := seenPipeline{p.ID, p.FinishedAt}
 	if _, ok := s.pipeSeen[sk]; ok {
-		return
+		return false
 	}
 	s.pipeSeen[sk] = finished
 	k := pipelineKey{projectPath, p.Status, refKind(p.Ref, p.Source, p.Tag, defaultRef)}
@@ -478,6 +641,29 @@ func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef s
 	if p.QueuedDuration != nil {
 		observe(s.pipeQueued, *p.QueuedDuration)
 	}
+	return true
+}
+
+// addMerged records a merge request once, by id, from its creation to its merge. A merge
+// request merged before the window start was counted by an earlier poll or predates the exporter.
+func (s *store) addMerged(projectPath string, m mergeRequest, since time.Time) {
+	created, err1 := time.Parse(time.RFC3339, m.CreatedAt)
+	merged, err2 := time.Parse(time.RFC3339, m.MergedAt)
+	if err1 != nil || err2 != nil || merged.Before(since) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.mrSeen[m.ID]; ok {
+		return
+	}
+	s.mrSeen[m.ID] = merged
+	h := s.mrMerge[projectPath]
+	if h == nil {
+		h = &histogram{}
+		s.mrMerge[projectPath] = h
+	}
+	h.observeIn(mergeBuckets, max(0, merged.Sub(created).Seconds()), time.Now())
 }
 
 // forget drops seen job ids older than the window a poll can return.
@@ -492,6 +678,21 @@ func (s *store) forget(before time.Time) {
 	for k, t := range s.pipeSeen {
 		if t.Before(before) {
 			delete(s.pipeSeen, k)
+		}
+	}
+	for id, t := range s.mrSeen {
+		if t.Before(before) {
+			delete(s.mrSeen, id)
+		}
+	}
+	for id, t := range s.retriedSeen {
+		if t.Before(before) {
+			delete(s.retriedSeen, id)
+		}
+	}
+	for k, a := range s.attempts {
+		if a.finished.Before(before) {
+			delete(s.attempts, k)
 		}
 	}
 }
@@ -515,6 +716,54 @@ func (s *store) expire(now time.Time, ttl time.Duration) {
 			}
 		}
 	}
+	for k, h := range s.mrMerge {
+		if now.Sub(h.last) > ttl {
+			delete(s.mrMerge, k)
+		}
+	}
+	for _, m := range []map[retryKey]*counter{s.retried, s.retryPassed} {
+		for k, c := range m {
+			if now.Sub(c.last) > ttl {
+				delete(m, k)
+			}
+		}
+	}
+	for k, c := range s.testFailures {
+		if now.Sub(c.last) > ttl {
+			delete(s.testFailures, k)
+		}
+	}
+}
+
+// addTestFailures counts the failed cases of one pipeline, at most maxFailedCases of them. A
+// series beyond maxTestSeries is dropped, so a broken suite cannot grow the exporter without bound.
+func (s *store) addTestFailures(projectPath string, r testReport) (dropped int) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	taken := 0
+	for _, suite := range r.TestSuites {
+		for _, c := range suite.TestCases {
+			if c.Status != "failed" && c.Status != "error" {
+				continue
+			}
+			if taken >= maxFailedCases {
+				return dropped
+			}
+			taken++
+			name := c.Name
+			if c.Classname != "" {
+				name = c.Classname + "." + c.Name
+			}
+			k := testKey{projectPath, truncateRunes(suite.Name, maxLabelLen), truncateRunes(name, maxLabelLen)}
+			if _, ok := s.testFailures[k]; !ok && len(s.testFailures) >= maxTestSeries {
+				dropped++
+				continue
+			}
+			bump(s.testFailures, k, now)
+		}
+	}
+	return dropped
 }
 
 func (s *store) count(c *float64) {
@@ -531,6 +780,10 @@ func jobTime(j job) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func refused(err error) bool {
+	return isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound })
 }
 
 func isStatus(err error, match func(code int) bool) bool {
@@ -562,6 +815,10 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	defaultSnap := map[string]int{}
 	issueSnap := map[string]int{}
 	mrSnap := map[string]int{}
+	oldestSnap := map[string]time.Time{}
+	stateSnap := map[string]map[string]int{}
+	unassignedSnap := map[string]int{}
+	storageSnap := map[storageKey]float64{}
 	pipelineSnap := map[string]map[string]int{}
 	for _, st := range pipelineStatuses {
 		pipelineSnap[st] = map[string]int{}
@@ -571,7 +828,16 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if p.OpenIssues != nil {
 			issueSnap[p.PathWithNamespace] = *p.OpenIssues
 		}
-		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
+		stats, fatal := projectStatistics(ctx, g, p, log, &errs)
+		if fatal != nil {
+			return fatal
+		}
+		for _, sk := range storageKinds {
+			if v, ok := stats[sk.field]; ok {
+				storageSnap[storageKey{p.PathWithNamespace, sk.kind}] = v
+			}
+		}
+		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&include_retried=true&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
 				return fatal
@@ -625,7 +891,29 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if fatal := pollPipelines(ctx, g, p, since, s, log, &errs, defaultSnap); fatal != nil {
 			return fatal
 		}
-		n, ok, err := openMergeRequests(ctx, g, p, log)
+		flow, err := openMergeRequests(ctx, g, p, s, log)
+		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
+			continue
+		}
+		if flow.hasTotal {
+			mrSnap[p.PathWithNamespace] = flow.total
+		}
+		if !flow.oldest.IsZero() {
+			oldestSnap[p.PathWithNamespace] = flow.oldest
+		}
+		if flow.byState != nil {
+			stateSnap[p.PathWithNamespace] = flow.byState
+		}
+		if fatal := pollMerged(ctx, g, p, since, s, log, &errs); fatal != nil {
+			return fatal
+		}
+		if p.OpenIssues == nil {
+			continue
+		}
+		n, ok, err := unassignedIssues(ctx, g, p, log)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
 				return fatal
@@ -633,8 +921,12 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 			continue
 		}
 		if ok {
-			mrSnap[p.PathWithNamespace] = n
+			unassignedSnap[p.PathWithNamespace] = n
 		}
+	}
+	milestones, fatal := pollMilestones(ctx, g, group, s, log, &errs)
+	if fatal != nil {
+		return fatal
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -645,6 +937,11 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	s.defaultFailed = defaultSnap
 	s.openIssues = issueSnap
 	s.openMRs = mrSnap
+	s.mrOldest = oldestSnap
+	s.mrStates = stateSnap
+	s.unassigned = unassignedSnap
+	s.storage = storageSnap
+	s.milestones = milestones
 	s.mu.Unlock()
 	return nil
 }
@@ -661,6 +958,7 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 		log.Warn("stopped paging a project's finished pipelines at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
 		s.count(&s.pageCapHits)
 	}
+	reports := true
 	for _, item := range list {
 		body, _, err := g.fetch(ctx, fmt.Sprintf("projects/%d/pipelines/%d", p.ID, item.ID))
 		var fp finishedPipeline
@@ -675,8 +973,12 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 			}
 			continue
 		}
-		if t, err := time.Parse(time.RFC3339, fp.FinishedAt); err == nil && !t.Before(since) {
-			s.addPipeline(p.PathWithNamespace, fp, p.DefaultBranch)
+		if t, err := time.Parse(time.RFC3339, fp.FinishedAt); err == nil && !t.Before(since) &&
+			s.addPipeline(p.PathWithNamespace, fp, p.DefaultBranch) && fp.Status == "failed" && reports {
+			var fatal error
+			if reports, fatal = pollTestReport(ctx, g, p, fp.ID, s, log, errs); fatal != nil {
+				return fatal
+			}
 		}
 	}
 	if p.DefaultBranch == "" {
@@ -697,20 +999,192 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 	return nil
 }
 
-// openMergeRequests reads the total from the X-Total header of a one-item page, so a project
-// costs one small read however many merge requests it has. GitLab leaves X-Total out above
-// 10000 items; counting those would take hundreds of pages, so such a project gets no series.
-func openMergeRequests(ctx context.Context, g gitlab, p project, log *slog.Logger) (n int, ok bool, err error) {
-	_, hdr, err := g.fetch(ctx, fmt.Sprintf("projects/%d/merge_requests?state=opened&per_page=1", p.ID))
+// mrFlow is what one read of a project's open merge requests tells.
+type mrFlow struct {
+	total    int
+	hasTotal bool
+	oldest   time.Time
+	byState  map[string]int
+}
+
+type testSummary struct {
+	Total struct {
+		Count int `json:"count"`
+	} `json:"total"`
+}
+
+type testReport struct {
+	TestSuites []struct {
+		Name      string `json:"name"`
+		TestCases []struct {
+			Status    string `json:"status"`
+			Name      string `json:"name"`
+			Classname string `json:"classname"`
+		} `json:"test_cases"`
+	} `json:"test_suites"`
+}
+
+// projectStatistics reads the sizes from the project itself: GitLab 19 sends
+// statistics: null in the group's project list even with statistics=true.
+// A refused read only means no storage series, so it never skips the project.
+func projectStatistics(ctx context.Context, g gitlab, p project, log *slog.Logger, errs *[]error) (map[string]float64, error) {
+	if p.Statistics != nil {
+		return p.Statistics, nil
+	}
+	full, err := getJSON[project](ctx, g, fmt.Sprintf("projects/%d?statistics=true", p.ID))
+	switch {
+	case err == nil:
+		return full.Statistics, nil
+	case refused(err):
+		log.Debug("no statistics for a project GitLab will not show them for", "project", p.PathWithNamespace, "err", err)
+		return nil, nil
+	case isStatus(err, func(c int) bool { return c == http.StatusTooManyRequests || c >= 500 }):
+		return nil, errors.Join(append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))...)
+	}
+	*errs = append(*errs, fmt.Errorf("%s: %w", p.PathWithNamespace, err))
+	return nil, nil
+}
+
+func getJSON[T any](ctx context.Context, g gitlab, path string) (v T, err error) {
+	body, _, err := g.fetch(ctx, path)
+	if err != nil {
+		return v, err
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return v, fmt.Errorf("GET %s: %w", path, err)
+	}
+	return v, nil
+}
+
+// pollTestReport counts the failed test cases of one failed pipeline. The small summary comes
+// first, so a pipeline without a report costs one read. more is false once GitLab refuses the
+// reads, so the project's other failed pipelines do not ask again in this poll.
+func pollTestReport(ctx context.Context, g gitlab, p project, pipelineID int, s *store, log *slog.Logger, errs *[]error) (more bool, fatal error) {
+	base := fmt.Sprintf("projects/%d/pipelines/%d/", p.ID, pipelineID)
+	sum, err := getJSON[testSummary](ctx, g, base+"test_report_summary")
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return false, fatal
+	}
+	if sum.Total.Count == 0 {
+		return true, nil
+	}
+	rep, err := getJSON[testReport](ctx, g, base+"test_report")
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return false, fatal
+	}
+	if n := s.addTestFailures(p.PathWithNamespace, rep); n > 0 {
+		log.Warn("left out failed test cases over the limit", "project", p.PathWithNamespace, "pipeline", pipelineID, "left_out", n)
+	}
+	return true, nil
+}
+
+// openMergeRequests pages through the open merge requests, oldest first, so the oldest one that is
+// not a draft is near the front even when the page cap cuts the list short. A capped list gives
+// no state counts, since they would be too low; the total then comes from the X-Total header,
+// which GitLab leaves out above 10000 items, and without it the project has no count series.
+func openMergeRequests(ctx context.Context, g gitlab, p project, s *store, log *slog.Logger) (f mrFlow, err error) {
+	list, capped, hdr, err := getPages[mergeRequest](ctx, g, fmt.Sprintf("projects/%d/merge_requests?state=opened&order_by=created_at&sort=asc&per_page=100", p.ID), maxJobPages, nil)
+	if err != nil {
+		return f, err
+	}
+	if capped {
+		log.Warn("stopped paging a project's open merge requests at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+		s.count(&s.pageCapHits)
+	}
+	if n, err := strconv.Atoi(hdr.Get("X-Total")); err == nil && n >= 0 {
+		f.total, f.hasTotal = n, true
+	} else if !capped {
+		f.total, f.hasTotal = len(list), true
+	} else {
+		log.Warn("GitLab sent no total of open merge requests, so the project has no series", "project", p.PathWithNamespace)
+	}
+	if !capped {
+		f.byState = map[string]int{}
+	}
+	for _, m := range list {
+		if f.byState != nil {
+			st := m.Status
+			if st == "" {
+				st = "unknown"
+			}
+			f.byState[truncateRunes(st, maxMRStateLen)]++
+		}
+		if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil && !m.isDraft() && (f.oldest.IsZero() || t.Before(f.oldest)) {
+			f.oldest = t
+		}
+	}
+	return f, nil
+}
+
+// pollMerged records the merge requests merged since the window start.
+func pollMerged(ctx context.Context, g gitlab, p project, since time.Time, s *store, log *slog.Logger, errs *[]error) error {
+	list, capped, err := get[mergeRequest](ctx, g, fmt.Sprintf("projects/%d/merge_requests?state=merged&updated_after=%s&order_by=updated_at&sort=desc&per_page=100",
+		p.ID, url.QueryEscape(since.UTC().Format(time.RFC3339))), maxJobPages, nil)
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return fatal
+	}
+	if capped {
+		log.Warn("stopped paging a project's merged merge requests at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+		s.count(&s.pageCapHits)
+	}
+	for _, m := range list {
+		s.addMerged(p.PathWithNamespace, m, since)
+	}
+	return nil
+}
+
+// unassignedIssues reads the total from the X-Total header of a one-item page, like the merge
+// request total of old, and leaves the project without a series when GitLab sends none.
+func unassignedIssues(ctx context.Context, g gitlab, p project, log *slog.Logger) (n int, ok bool, err error) {
+	_, hdr, err := g.fetch(ctx, fmt.Sprintf("projects/%d/issues?state=opened&assignee_id=None&per_page=1", p.ID))
 	if err != nil {
 		return 0, false, err
 	}
 	n, err = strconv.Atoi(hdr.Get("X-Total"))
 	if err != nil || n < 0 {
-		log.Warn("GitLab sent no total of open merge requests, so the project has no series", "project", p.PathWithNamespace)
+		log.Warn("GitLab sent no total of unassigned issues, so the project has no series", "project", p.PathWithNamespace)
 		return 0, false, nil
 	}
 	return n, true, nil
+}
+
+// pollMilestones reads the group's active milestones, first page only, and the issue counts of
+// each. A read GitLab refuses with 403 or 404 gives no milestone series and is not counted as a
+// skipped project; the group's path stands in for a project in the error messages.
+func pollMilestones(ctx context.Context, g gitlab, group string, s *store, log *slog.Logger, errs *[]error) (map[string]milestoneStat, error) {
+	snap := map[string]milestoneStat{}
+	gp := project{PathWithNamespace: group}
+	base := "groups/" + url.PathEscape(group)
+	list, _, err := get[milestone](ctx, g, base+fmt.Sprintf("/milestones?state=active&per_page=%d", maxMilestones), 1, nil)
+	if refused(err) {
+		log.Debug("skipping the milestones GitLab will not show", "group", group, "err", err)
+		return snap, nil
+	}
+	if skip, fatal := classify(err, gp, s, log, errs); skip || fatal != nil {
+		return snap, fatal
+	}
+	for _, m := range list {
+		title := truncateRunes(m.Title, maxLabelLen)
+		if _, dup := snap[title]; dup || m.Title == "" {
+			continue
+		}
+		st, err := getJSON[issueStatistics](ctx, g, base+"/issues_statistics?milestone="+url.QueryEscape(m.Title))
+		if refused(err) {
+			continue
+		}
+		if skip, fatal := classify(err, gp, s, log, errs); skip || fatal != nil {
+			if fatal != nil {
+				return snap, fatal
+			}
+			continue
+		}
+		ms := milestoneStat{opened: st.Statistics.Counts.Opened, closed: st.Statistics.Counts.Closed}
+		if d, err := time.Parse("2006-01-02", m.DueDate); err == nil {
+			ms.due = d
+		}
+		snap[title] = ms
+	}
+	return snap, nil
 }
 
 // classify sorts a failed project read: skip it, end the poll (fatal), or remember the error and go on.
@@ -718,7 +1192,7 @@ func classify(err error, p project, s *store, log *slog.Logger, errs *[]error) (
 	switch {
 	case err == nil:
 		return false, nil
-	case isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound }):
+	case refused(err):
 		log.Debug("skipping a project GitLab will not show", "project", p.PathWithNamespace, "err", err)
 		s.count(&s.projectsSkipped)
 		return true, nil
@@ -785,6 +1259,7 @@ func (s *store) writeOpenCounts(w *strings.Builder) {
 	}{
 		{"ci_project_open_issues", "Open issues of a project at the last good poll; no series when the project has issues disabled.", s.openIssues},
 		{"ci_project_open_merge_requests", "Open merge requests of a project at the last good poll; no series when GitLab sent no total.", s.openMRs},
+		{"ci_issues_unassigned", "Open issues without an assignee at the last good poll; no series when the project has issues disabled or GitLab sent no total.", s.unassigned},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", m.name, m.help, m.name)
 		projects := make([]string, 0, len(m.counts))
@@ -797,6 +1272,112 @@ func (s *store) writeOpenCounts(w *strings.Builder) {
 		}
 	}
 }
+
+func (s *store) writeMergeRequests(w *strings.Builder) {
+	projects := make([]string, 0, len(s.mrOldest))
+	for p := range s.mrOldest {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	now := s.now()
+	fmt.Fprint(w, "# HELP ci_merge_request_oldest_open_seconds Age of the oldest open merge request that is not a draft, counted from its creation, at scrape time.\n# TYPE ci_merge_request_oldest_open_seconds gauge\n")
+	for _, p := range projects {
+		fmt.Fprintf(w, "ci_merge_request_oldest_open_seconds{project=\"%s\"} %g\n", escLabel(p), max(0, now.Sub(s.mrOldest[p]).Seconds()))
+	}
+	fmt.Fprint(w, "# HELP ci_merge_requests_open_by_state Open merge requests by GitLab's detailed merge status at the last good poll; no series for a project whose list hit the page limit.\n# TYPE ci_merge_requests_open_by_state gauge\n")
+	projects = projects[:0]
+	for p := range s.mrStates {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		states := make([]string, 0, len(s.mrStates[p]))
+		for st := range s.mrStates[p] {
+			states = append(states, st)
+		}
+		sort.Strings(states)
+		for _, st := range states {
+			fmt.Fprintf(w, "ci_merge_requests_open_by_state{project=\"%s\",state=\"%s\"} %d\n", escLabel(p), escLabel(st), s.mrStates[p][st])
+		}
+	}
+	const name = "ci_merge_request_time_to_merge_seconds"
+	fmt.Fprintf(w, "# HELP %s How long a merge request took from its creation to its merge.\n# TYPE %s histogram\n", name, name)
+	projects = projects[:0]
+	for p := range s.mrMerge {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		h, l := s.mrMerge[p], fmt.Sprintf(`project="%s"`, escLabel(p))
+		for i, b := range mergeBuckets {
+			fmt.Fprintf(w, "%s_bucket{%s,le=\"%g\"} %d\n", name, l, b, h.counts[i])
+		}
+		fmt.Fprintf(w, "%s_bucket{%s,le=\"+Inf\"} %d\n%s_sum{%s} %g\n%s_count{%s} %d\n", name, l, h.count, name, l, h.sum, name, l, h.count)
+	}
+}
+
+func (s *store) writeCounters(w *strings.Builder) {
+	for _, m := range []struct {
+		name, help string
+		c          map[retryKey]*counter
+	}{
+		{"ci_job_retried_total", "Finished jobs that were later retried, each job run counted once.", s.retried},
+		{"ci_job_retry_passed_total", "Jobs that failed and whose retry in the same pipeline succeeded, counted once per job and pipeline.", s.retryPassed},
+	} {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", m.name, m.help, m.name)
+		keys := make([]retryKey, 0, len(m.c))
+		for k := range m.c {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
+		for _, k := range keys {
+			fmt.Fprintf(w, "%s{project=\"%s\",job=\"%s\",ref=\"%s\"} %g\n", m.name, escLabel(k.project), escLabel(k.job), escLabel(k.ref), m.c[k].n)
+		}
+	}
+	fmt.Fprint(w, "# HELP ci_test_failures_total Failed test cases of failed pipelines, from their test reports, each pipeline counted once.\n# TYPE ci_test_failures_total counter\n")
+	keys := make([]testKey, 0, len(s.testFailures))
+	for k := range s.testFailures {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_test_failures_total{project=\"%s\",suite=\"%s\",test=\"%s\"} %g\n", escLabel(k.project), escLabel(k.suite), escLabel(k.test), s.testFailures[k].n)
+	}
+}
+
+func (s *store) writeGroupGauges(w *strings.Builder) {
+	titles := make([]string, 0, len(s.milestones))
+	for t := range s.milestones {
+		titles = append(titles, t)
+	}
+	sort.Strings(titles)
+	fmt.Fprint(w, "# HELP ci_milestone_issues Issues of an active group milestone by state (opened or closed) at the last good poll.\n# TYPE ci_milestone_issues gauge\n")
+	for _, t := range titles {
+		fmt.Fprintf(w, "ci_milestone_issues{milestone=\"%s\",state=\"opened\"} %d\nci_milestone_issues{milestone=\"%s\",state=\"closed\"} %d\n", escLabel(t), s.milestones[t].opened, escLabel(t), s.milestones[t].closed)
+	}
+	fmt.Fprint(w, "# HELP ci_milestone_due_timestamp_seconds Due date of an active group milestone as a Unix time; no series for a milestone without one.\n# TYPE ci_milestone_due_timestamp_seconds gauge\n")
+	for _, t := range titles {
+		if due := s.milestones[t].due; !due.IsZero() {
+			fmt.Fprintf(w, "ci_milestone_due_timestamp_seconds{milestone=\"%s\"} %d\n", escLabel(t), due.Unix())
+		}
+	}
+	fmt.Fprint(w, "# HELP ci_project_storage_bytes Storage a project uses by kind, from GitLab's project statistics at the last good poll; no series when GitLab sends none.\n# TYPE ci_project_storage_bytes gauge\n")
+	keys := make([]storageKey, 0, len(s.storage))
+	for k := range s.storage {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].project != keys[j].project {
+			return keys[i].project < keys[j].project
+		}
+		return keys[i].kind < keys[j].kind
+	})
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_project_storage_bytes{project=\"%s\",kind=\"%s\"} %g\n", escLabel(k.project), k.kind, s.storage[k])
+	}
+}
+
+func escLabel(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 
 func pipelineLabel(k pipelineKey) string {
 	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
@@ -843,6 +1424,9 @@ func (s *store) write(w *strings.Builder) {
 	s.writePending(w)
 	s.writePipelines(w)
 	s.writeOpenCounts(w)
+	s.writeMergeRequests(w)
+	s.writeCounters(w)
+	s.writeGroupGauges(w)
 	s.writeFinishedPipelines(w)
 	for _, m := range []struct {
 		name, help string
