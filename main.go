@@ -388,6 +388,8 @@ type key struct{ project, job, part, runner, status, ref string }
 
 type pendingKey struct{ project, tags string }
 
+type runningKey struct{ project, tags, runner string }
+
 type pipelineKey struct{ project, status, ref string }
 
 // seenPipeline tells a retried pipeline, which finishes again under the same id, from one already counted.
@@ -441,6 +443,8 @@ type store struct {
 	mu              sync.Mutex
 	now             func() time.Time
 	pending         map[pendingKey]*pendingStat
+	running         map[runningKey]int
+	created         map[string]int
 	pipelines       map[string]map[string]int
 	duration        map[key]*histogram
 	queued          map[key]*histogram
@@ -471,7 +475,7 @@ type store struct {
 }
 
 func newStore() *store {
-	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
+	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, running: map[runningKey]int{}, created: map[string]int{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
 		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{},
 		mrOldest: map[string]time.Time{}, mrStates: map[string]map[string]int{}, mrMerge: map[string]*histogram{}, mrSeen: map[int]time.Time{},
 		unassigned: map[string]int{}, storage: map[storageKey]float64{}, milestones: map[string]milestoneStat{},
@@ -816,6 +820,8 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	}
 	var errs []error
 	snapshot := map[pendingKey]*pendingStat{}
+	runningSnap := map[runningKey]int{}
+	createdSnap := map[string]int{}
 	defaultSnap := map[string]int{}
 	issueSnap := map[string]int{}
 	mrSnap := map[string]int{}
@@ -857,7 +863,8 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 				s.add(p.PathWithNamespace, j, p.DefaultBranch)
 			}
 		}
-		waiting, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=pending&per_page=100", p.ID), maxJobPages, nil)
+		// One read for every job not finished yet: waiting for a runner, running, or waiting for an earlier stage.
+		waiting, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=pending&scope[]=running&scope[]=created&per_page=100", p.ID), maxJobPages, nil)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
 				return fatal
@@ -865,11 +872,22 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 			continue
 		}
 		if capped {
-			log.Warn("stopped paging a project's pending jobs at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
+			log.Warn("stopped paging a project's unfinished jobs at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
 			s.count(&s.pageCapHits)
 		}
 		for _, j := range waiting {
-			addPending(snapshot, p.PathWithNamespace, j)
+			switch j.Status {
+			case "pending":
+				addPending(snapshot, p.PathWithNamespace, j)
+			case "running":
+				runner := "none"
+				if j.Runner != nil && j.Runner.Description != "" {
+					runner = j.Runner.Description
+				}
+				runningSnap[runningKey{p.PathWithNamespace, tagsLabel(j.TagList), runner}]++
+			case "created":
+				createdSnap[p.PathWithNamespace]++
+			}
 		}
 		skipped := false
 		for _, st := range pipelineStatuses {
@@ -937,6 +955,8 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	}
 	s.mu.Lock()
 	s.pending = snapshot
+	s.running = runningSnap
+	s.created = createdSnap
 	s.pipelines = pipelineSnap
 	s.defaultFailed = defaultSnap
 	s.openIssues = issueSnap
@@ -1240,6 +1260,37 @@ func (s *store) writePending(w *strings.Builder) {
 	}
 }
 
+func (s *store) writeUnfinished(w *strings.Builder) {
+	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
+	keys := make([]runningKey, 0, len(s.running))
+	for k := range s.running {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.project != b.project {
+			return a.project < b.project
+		}
+		if a.tags != b.tags {
+			return a.tags < b.tags
+		}
+		return a.runner < b.runner
+	})
+	fmt.Fprint(w, "# HELP ci_jobs_running Jobs running at the last good poll, by the runner that took them.\n# TYPE ci_jobs_running gauge\n")
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_jobs_running{project=\"%s\",tags=\"%s\",runner=\"%s\"} %d\n", esc(k.project), esc(k.tags), esc(k.runner), s.running[k])
+	}
+	projects := make([]string, 0, len(s.created))
+	for p := range s.created {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	fmt.Fprint(w, "# HELP ci_jobs_created Jobs waiting for an earlier stage of their pipeline at the last good poll.\n# TYPE ci_jobs_created gauge\n")
+	for _, p := range projects {
+		fmt.Fprintf(w, "ci_jobs_created{project=\"%s\"} %d\n", esc(p), s.created[p])
+	}
+}
+
 func (s *store) writePipelines(w *strings.Builder) {
 	esc := func(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 	for _, st := range pipelineStatuses {
@@ -1426,6 +1477,7 @@ func (s *store) write(w *strings.Builder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writePending(w)
+	s.writeUnfinished(w)
 	s.writePipelines(w)
 	s.writeOpenCounts(w)
 	s.writeMergeRequests(w)

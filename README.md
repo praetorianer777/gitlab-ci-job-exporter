@@ -17,6 +17,8 @@ GitLab REST API instead. It is read-only and uses the standard library only.
 | `ci_job_queued_seconds` | histogram | How long a finished job waited for a runner. |
 | `ci_jobs_pending` | gauge | Jobs waiting for a runner, per `project` and `tags`. |
 | `ci_job_pending_oldest_seconds` | gauge | Age of the oldest waiting job per `project` and `tags`: the time since its `created_at`, computed at scrape time. |
+| `ci_jobs_running` | gauge | Jobs running, per `project`, `tags` and `runner` (the runner's description, `none` if GitLab names none). Counts every runner, scraped or not. |
+| `ci_jobs_created` | gauge | Jobs waiting for an earlier stage of their pipeline (status `created`), per `project`; they have not asked for a runner yet. |
 | `ci_pipelines_pending` | gauge | Pipelines with status `pending` (no job has found a runner yet), per `project`. |
 | `ci_pipelines_running` | gauge | Pipelines with status `running`, per `project`. |
 | `ci_pipeline_duration_seconds` | histogram | How long a finished pipeline took from its creation to its end, waiting included: what someone waiting on it sees. |
@@ -59,6 +61,12 @@ good poll replaces the whole set, so a project with no waiting jobs has no
 series; a failed poll keeps the previous set. Age is measured from
 `created_at`, not from GitLab's `queued_duration`, which is only set once a
 runner has taken the job.
+
+`ci_jobs_running` and `ci_jobs_created` come from the same read as the pending
+jobs, `projects/:id/jobs?scope[]=pending&scope[]=running&scope[]=created`, so
+they cost no extra request, and are replaced the same way. `ci_jobs_running`
+counts the jobs of runners whose own metrics are not scraped too, so it
+matches GitLab's count where `gitlab_runner_jobs` cannot.
 
 The two pipeline gauges carry only `project`. They are read from
 `projects/:id/pipelines?status=pending` and `?status=running` and replaced as a
