@@ -814,13 +814,21 @@ func openCountsGitLab(t *testing.T, issues, mrs *atomic.Int32, status *atomic.In
 				http.Error(w, "no", int(c))
 				return
 			}
-			if q := r.URL.Query(); q.Get("state") != "opened" || q.Get("per_page") != "1" {
+			q := r.URL.Query()
+			if q.Get("state") == "merged" {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			if q.Get("state") != "opened" || q.Get("per_page") != "100" {
 				http.Error(w, "unexpected query", http.StatusBadRequest)
 				return
 			}
-			if id != "3" {
-				w.Header().Set("X-Total", fmt.Sprint(mrs.Load()))
+			if id == "3" {
+				w.Header().Set("X-Next-Page", "2")
+				fmt.Fprint(w, `[{"id":1}]`)
+				return
 			}
+			w.Header().Set("X-Total", fmt.Sprint(mrs.Load()))
 			fmt.Fprint(w, `[]`)
 		})
 	}
@@ -916,5 +924,141 @@ func TestAProjectWhoseJobsAreRefusedStillHasItsIssueCount(t *testing.T) {
 	}
 	if out := render(s); !strings.Contains(out, `ci_project_open_issues{project="g/no-ci"} 4`) {
 		t.Errorf("the issue count of a project without CI is missing:\n%s", out)
+	}
+}
+
+// flowGitLab serves one project whose open and merged merge request lists a test can change or break.
+func flowGitLab(t *testing.T, open, merged *atomic.Value, status *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("/api/v4/projects/1/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		if c := status.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		switch r.URL.Query().Get("state") {
+		case "opened":
+			fmt.Fprint(w, open.Load().(string))
+		case "merged":
+			if r.URL.Query().Get("updated_after") == "" {
+				http.Error(w, "no window", http.StatusBadRequest)
+				return
+			}
+			fmt.Fprint(w, merged.Load().(string))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newFlow(open, merged string) (*atomic.Value, *atomic.Value, *atomic.Int32) {
+	var o, m atomic.Value
+	var st atomic.Int32
+	o.Store(open)
+	m.Store(merged)
+	return &o, &m, &st
+}
+
+func TestMergeRequestFlowIsExported(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	open, merged, status := newFlow(fmt.Sprintf(`[
+	  {"id":1,"created_at":%q,"draft":true,"detailed_merge_status":"draft_status"},
+	  {"id":2,"created_at":%q,"detailed_merge_status":"ci_must_pass"},
+	  {"id":3,"created_at":%q,"detailed_merge_status":"mergeable"},
+	  {"id":4,"created_at":%q,"detailed_merge_status":"mergeable"},
+	  {"id":5,"created_at":%q,"detailed_merge_status":"%s"}]`,
+		stamp(now.Add(-100*time.Hour)), stamp(now.Add(-2*time.Hour)), stamp(now.Add(-time.Hour)), stamp(now.Add(-time.Minute)), stamp(now), strings.Repeat("x", 40)),
+		fmt.Sprintf(`[{"id":10,"created_at":%q,"merged_at":%q},{"id":11,"created_at":%q,"merged_at":%q},{"id":12,"created_at":%q,"merged_at":%q}]`,
+			stamp(now.Add(-3*time.Hour)), stamp(now.Add(-time.Hour)),
+			stamp(now.Add(-30*time.Hour)), stamp(now.Add(-5*time.Minute)),
+			stamp(now.Add(-50*time.Hour)), stamp(now.Add(-20*time.Minute))))
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	s.now = func() time.Time { return now }
+	// Merge request 12 was merged before the window, so a poll that overlaps an earlier one must not count it.
+	since := now.Add(-10 * time.Minute)
+	if err := poll(context.Background(), g, "g", since, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_project_open_merge_requests{project="g/a"} 5` + "\n",
+		`ci_merge_request_oldest_open_seconds{project="g/a"} 7200` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="ci_must_pass"} 1` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="draft_status"} 1` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="mergeable"} 2` + "\n",
+		`ci_merge_requests_open_by_state{project="g/a",state="` + strings.Repeat("x", 32) + `"} 1` + "\n",
+		`ci_merge_request_time_to_merge_seconds_count{project="g/a"} 1` + "\n",
+		`ci_merge_request_time_to_merge_seconds_sum{project="g/a"} 107700` + "\n",
+		`ci_merge_request_time_to_merge_seconds_bucket{project="g/a",le="86400"} 0` + "\n",
+		`ci_merge_request_time_to_merge_seconds_bucket{project="g/a",le="172800"} 1` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+}
+
+func TestMergedMergeRequestIsObservedOncePerId(t *testing.T) {
+	now := time.Now()
+	open, merged, status := newFlow(`[]`, fmt.Sprintf(`[{"id":10,"created_at":%q,"merged_at":%q}]`, stamp(now.Add(-2*time.Hour)), stamp(now.Add(-time.Minute))))
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	for range 2 {
+		if err := poll(context.Background(), g, "g", now.Add(-10*time.Minute), s, quiet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out := render(s); !strings.Contains(out, `ci_merge_request_time_to_merge_seconds_count{project="g/a"} 1`+"\n") {
+		t.Errorf("a merge request seen in two polls was not counted once:\n%s", out)
+	}
+	if out := render(s); strings.Contains(out, "ci_merge_request_oldest_open_seconds{") {
+		t.Errorf("a project without open merge requests has an age series:\n%s", out)
+	}
+}
+
+func TestMergeRequestFlowGaugesSurviveAFailedPollAndAreReplaced(t *testing.T) {
+	now := time.Now()
+	open, merged, status := newFlow(fmt.Sprintf(`[{"id":2,"created_at":%q,"detailed_merge_status":"mergeable"}]`, stamp(now.Add(-time.Hour))), `[]`)
+	srv := flowGitLab(t, open, merged, status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	s.now = func() time.Time { return now }
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	open.Store(fmt.Sprintf(`[{"id":2,"created_at":%q,"detailed_merge_status":"conflict"}]`, stamp(now.Add(-time.Hour))))
+	status.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err == nil {
+		t.Fatal("a failing read returned no error")
+	}
+	if out := render(s); !strings.Contains(out, `state="mergeable"} 1`) || strings.Contains(out, `state="conflict"`) {
+		t.Errorf("a failed poll changed the state counts:\n%s", out)
+	}
+	status.Store(0)
+	if err := poll(context.Background(), g, "g", now, s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `state="mergeable"`) || !strings.Contains(out, `state="conflict"} 1`) {
+		t.Errorf("a good poll did not replace the state counts:\n%s", out)
+	}
+}
+
+func TestOpenMergeRequestsAtThePageLimitHaveNoStateCounts(t *testing.T) {
+	var issues, mrs, status atomic.Int32
+	srv := openCountsGitLab(t, &issues, &mrs, &status)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); strings.Contains(out, `ci_merge_requests_open_by_state{project="g/huge"`) || s.pageCapHits == 0 {
+		t.Errorf("a capped list has state counts or the cap went uncounted (%v):\n%s", s.pageCapHits, out)
 	}
 }
