@@ -567,6 +567,10 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		pipelineSnap[st] = map[string]int{}
 	}
 	for _, p := range projects {
+		// The count comes with the project list, so a project whose other reads are refused still has one.
+		if p.OpenIssues != nil {
+			issueSnap[p.PathWithNamespace] = *p.OpenIssues
+		}
 		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
@@ -620,9 +624,6 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		}
 		if fatal := pollPipelines(ctx, g, p, since, s, log, &errs, defaultSnap); fatal != nil {
 			return fatal
-		}
-		if p.OpenIssues != nil {
-			issueSnap[p.PathWithNamespace] = *p.OpenIssues
 		}
 		n, ok, err := openMergeRequests(ctx, g, p, log)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {

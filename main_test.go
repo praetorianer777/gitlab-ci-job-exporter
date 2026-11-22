@@ -901,3 +901,20 @@ func TestForbiddenMergeRequestReadIsSkippedNotAnError(t *testing.T) {
 		t.Errorf("err=%v skipped=%v, want no error and 3 skips", err, s.projectsSkipped)
 	}
 }
+
+func TestAProjectWhoseJobsAreRefusedStillHasItsIssueCount(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/no-ci","open_issues_count":4}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/1/jobs", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusForbidden) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); !strings.Contains(out, `ci_project_open_issues{project="g/no-ci"} 4`) {
+		t.Errorf("the issue count of a project without CI is missing:\n%s", out)
+	}
+}
