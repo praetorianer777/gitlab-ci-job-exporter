@@ -147,7 +147,7 @@ All settings are environment variables.
 | --- | --- | --- |
 | `GITLAB_URL` | required | Base URL of the GitLab instance, for example `https://gitlab.example.com`. Must be `https` unless `ALLOW_INSECURE_HTTP=true`. |
 | `ALLOW_INSECURE_HTTP` | `false` | Set to `true` to accept an `http` GitLab URL. The token then travels in clear text. |
-| `GITLAB_GROUP` | required | Group path or ID. Subgroups are included, archived projects are not. |
+| `GITLAB_GROUP` | required | Group path or ID. Subgroups are included, archived projects and projects scheduled for deletion are not. |
 | `GITLAB_TOKEN_FILE` | required | Path to a file that contains the access token. |
 | `INTERVAL` | `2m` | Time between polls; at least `10s`. |
 | `LOOKBACK` | `15m` | How far back the first poll looks for finished jobs; greater than zero. No poll reaches back further than 6 hours. |

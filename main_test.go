@@ -1428,3 +1428,25 @@ func TestForbiddenMilestonesAndIssuesAreSkippedNotAnError(t *testing.T) {
 		t.Errorf("storage depends on the refused reads:\n%s", out)
 	}
 }
+
+func TestAProjectScheduledForDeletionIsSkipped(t *testing.T) {
+	var reads atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/live","open_issues_count":2},{"id":2,"path_with_namespace":"g/live-deletion_scheduled-2","open_issues_count":9,"marked_for_deletion_on":"2026-11-11"}]`)
+	})
+	mux.HandleFunc("/api/v4/projects/2/", func(w http.ResponseWriter, r *http.Request) { reads.Add(1); fmt.Fprint(w, `[]`) })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	if !strings.Contains(out, `ci_project_open_issues{project="g/live"} 2`) || strings.Contains(out, "deletion_scheduled") {
+		t.Errorf("want only the live project:\n%s", out)
+	}
+	if n := reads.Load(); n != 0 {
+		t.Errorf("the project scheduled for deletion was read %d times", n)
+	}
+}
