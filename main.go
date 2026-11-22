@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,6 +152,8 @@ type project struct {
 	ID                int    `json:"id"`
 	PathWithNamespace string `json:"path_with_namespace"`
 	DefaultBranch     string `json:"default_branch"`
+	// Set while a project waits for deletion; it keeps the list under a renamed path until then.
+	MarkedForDeletionOn string `json:"marked_for_deletion_on"`
 	// A pointer: GitLab leaves the field out when the project has issues disabled.
 	OpenIssues *int `json:"open_issues_count"`
 	// Only sent with statistics=true and a token that may read them; sizes are in bytes.
@@ -799,6 +802,7 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	if capped {
 		return fmt.Errorf("the group has more than %d pages of projects", maxProjectPages)
 	}
+	projects = slices.DeleteFunc(projects, func(p project) bool { return p.MarkedForDeletionOn != "" })
 	older := func(page []job) bool {
 		if len(page) == 0 {
 			return true
