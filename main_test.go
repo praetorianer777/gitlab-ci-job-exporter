@@ -169,7 +169,7 @@ func TestNextPageOnAnotherHostIsIgnored(t *testing.T) {
 	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil {
 		t.Fatal(err)
 	}
-	if leaked.Load() || pages.Load() != 1 {
+	if leaked.Load() || pages.Load() != 2 {
 		t.Errorf("a Link header to another host was followed (leaked=%v, requests=%d)", leaked.Load(), pages.Load())
 	}
 }
@@ -364,7 +364,7 @@ func TestTooManyRequestsIsRetriedOnceWhenShort(t *testing.T) {
 	}))
 	defer srv.Close()
 	g := gitlab{base: srv.URL, token: "t", client: newClient()}
-	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil || calls.Load() != 2 {
+	if err := poll(context.Background(), g, "g", time.Now(), newStore(), quiet); err != nil || calls.Load() != 3 {
 		t.Errorf("err=%v calls=%d, want success after one retry", err, calls.Load())
 	}
 }
@@ -1227,7 +1227,7 @@ func TestFailingTestsAreCountedOncePerFailedPipeline(t *testing.T) {
 		t.Errorf("read %d test reports, want 1: one failed pipeline has tests, one has none, one passed, and none is read twice", reads.Load())
 	}
 	out := render(s)
-	suite := strings.Repeat("s", maxTestLen)
+	suite := strings.Repeat("s", maxLabelLen)
 	for _, want := range []string{
 		`ci_test_failures_total{project="g/a",suite="` + suite + `",test="pkg.Suite.TestA"} 1` + "\n",
 		`ci_test_failures_total{project="g/a",suite="` + suite + `",test="TestB"} 1` + "\n",
@@ -1272,5 +1272,151 @@ func TestTestSeriesAreCapped(t *testing.T) {
 	}
 	if len(s.testFailures) != maxTestSeries {
 		t.Errorf("%d test series, want the cap of %d", len(s.testFailures), maxTestSeries)
+	}
+}
+
+// groupGitLab serves two projects, one with storage statistics and one without, and the group's
+// milestones. A test can change the counts or make the milestone, statistics or issue reads fail.
+func groupGitLab(t *testing.T, opened *atomic.Int32, milestoneStatus, statsStatus, issueStatus *atomic.Int32, pages *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("statistics") != "true" {
+			http.Error(w, "statistics not asked for", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, `[{"id":1,"path_with_namespace":"g/a","open_issues_count":4,"statistics":{"repository_size":1000,"job_artifacts_size":2500.5,"container_registry_size":7,"commit_count":9}},
+		  {"id":2,"path_with_namespace":"g/b","open_issues_count":1},{"id":3,"path_with_namespace":"g/noissues"}]`)
+	})
+	for _, id := range []string{"1", "2", "3"} {
+		mux.HandleFunc("/api/v4/projects/"+id+"/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/merge_requests", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/issues", func(w http.ResponseWriter, r *http.Request) {
+			if c := issueStatus.Load(); c != 0 {
+				http.Error(w, "no", int(c))
+				return
+			}
+			if q := r.URL.Query(); q.Get("state") != "opened" || q.Get("assignee_id") != "None" || q.Get("per_page") != "1" {
+				http.Error(w, "unexpected query", http.StatusBadRequest)
+				return
+			}
+			if id == "1" {
+				w.Header().Set("X-Total", "3")
+			}
+			fmt.Fprint(w, `[]`)
+		})
+	}
+	mux.HandleFunc("/api/v4/groups/g/milestones", func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		if c := milestoneStatus.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		if q := r.URL.Query(); q.Get("state") != "active" || q.Get("per_page") != "100" {
+			http.Error(w, "unexpected query", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Next-Page", "2")
+		fmt.Fprintf(w, `[{"title":"v1.0","due_date":"2026-12-01"},{"title":"later"},{"title":"v1.0","due_date":"2027-01-01"},{"title":%q}]`, strings.Repeat("m", 200))
+	})
+	mux.HandleFunc("/api/v4/groups/g/issues_statistics", func(w http.ResponseWriter, r *http.Request) {
+		if c := statsStatus.Load(); c != 0 {
+			http.Error(w, "no", int(c))
+			return
+		}
+		n := int(opened.Load())
+		if r.URL.Query().Get("milestone") == "later" {
+			n = 0
+		}
+		fmt.Fprintf(w, `{"statistics":{"counts":{"all":%d,"closed":2,"opened":%d}}}`, n+2, n)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestMilestonesUnassignedAndStorageAreExported(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	opened.Store(5)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_milestone_issues{milestone="later",state="opened"} 0` + "\n" + `ci_milestone_issues{milestone="later",state="closed"} 2` + "\n",
+		`ci_milestone_issues{milestone="v1.0",state="opened"} 5` + "\n" + `ci_milestone_issues{milestone="v1.0",state="closed"} 2` + "\n",
+		`ci_milestone_due_timestamp_seconds{milestone="v1.0"} 1796083200` + "\n",
+		`ci_milestone_issues{milestone="` + strings.Repeat("m", maxLabelLen) + `",state="opened"} 5`,
+		`ci_issues_unassigned{project="g/a"} 3` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="repository"} 1000` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="job_artifacts"} 2500.5` + "\n",
+		`ci_project_storage_bytes{project="g/a",kind="container_registry"} 7` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, `ci_milestone_issues{milestone="v1.0",state="opened"}`); n != 1 {
+		t.Errorf("a milestone title that occurs twice has %d series", n)
+	}
+	for _, bad := range []string{`ci_milestone_due_timestamp_seconds{milestone="later"}`, `ci_project_storage_bytes{project="g/b"`, `ci_issues_unassigned{project="g/b"}`, `ci_issues_unassigned{project="g/noissues"}`, `kind="commit_count"`} {
+		if strings.Contains(out, bad) {
+			t.Errorf("metrics have a series that should not exist: %s\n%s", bad, out)
+		}
+	}
+	if pages.Load() != 1 {
+		t.Errorf("read %d pages of milestones, want only the first", pages.Load())
+	}
+}
+
+func TestMilestoneAndUnassignedGaugesAreReplacedAndFailedPollKeepsThem(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	opened.Store(5)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	opened.Store(8)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if out := render(s); !strings.Contains(out, `ci_milestone_issues{milestone="v1.0",state="opened"} 8`) {
+		t.Fatalf("a good poll did not replace the milestone counts:\n%s", out)
+	}
+	opened.Store(9)
+	st.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("a failing milestone read returned no error")
+	}
+	st.Store(0)
+	is.Store(http.StatusBadGateway)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("a failing issue read returned no error")
+	}
+	out := render(s)
+	if !strings.Contains(out, `ci_milestone_issues{milestone="v1.0",state="opened"} 8`) || !strings.Contains(out, `ci_issues_unassigned{project="g/a"} 3`) {
+		t.Errorf("a failed poll changed the gauges:\n%s", out)
+	}
+}
+
+func TestForbiddenMilestonesAndIssuesAreSkippedNotAnError(t *testing.T) {
+	var opened, ms, st, is, pages atomic.Int32
+	ms.Store(http.StatusForbidden)
+	is.Store(http.StatusForbidden)
+	srv := groupGitLab(t, &opened, &ms, &st, &is, &pages)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatalf("refused reads ended the poll: %v", err)
+	}
+	out := render(s)
+	if strings.Contains(out, "\nci_milestone_issues{") || strings.Contains(out, "\nci_issues_unassigned{") || s.projectsSkipped != 2 {
+		t.Errorf("skipped=%v, want 2 (the projects with issues enabled) and no series:\n%s", s.projectsSkipped, out)
+	}
+	if !strings.Contains(out, `ci_project_storage_bytes{project="g/a",kind="repository"} 1000`) {
+		t.Errorf("storage depends on the refused reads:\n%s", out)
 	}
 }

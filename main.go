@@ -33,9 +33,10 @@ const (
 	maxWindow        = 6 * time.Hour
 	maxJobPages      = 20
 	maxMRStateLen    = 32
-	maxTestLen       = 128
+	maxLabelLen      = 128
 	maxFailedCases   = 50
 	maxTestSeries    = 2000
+	maxMilestones    = 100
 	maxProjectPages  = 1000
 	maxBodyBytes     = 32 << 20
 	maxDrainBytes    = 1 << 20
@@ -152,6 +153,42 @@ type project struct {
 	DefaultBranch     string `json:"default_branch"`
 	// A pointer: GitLab leaves the field out when the project has issues disabled.
 	OpenIssues *int `json:"open_issues_count"`
+	// Only sent with statistics=true and a token that may read them; sizes are in bytes.
+	Statistics map[string]float64 `json:"statistics"`
+}
+
+// storageKinds maps the statistics fields to the kind label of ci_project_storage_bytes.
+var storageKinds = []struct{ kind, field string }{
+	{"repository", "repository_size"},
+	{"wiki", "wiki_size"},
+	{"lfs", "lfs_objects_size"},
+	{"job_artifacts", "job_artifacts_size"},
+	{"pipeline_artifacts", "pipeline_artifacts_size"},
+	{"packages", "packages_size"},
+	{"snippets", "snippets_size"},
+	{"uploads", "uploads_size"},
+	{"container_registry", "container_registry_size"},
+}
+
+type storageKey struct{ project, kind string }
+
+type milestone struct {
+	Title   string `json:"title"`
+	DueDate string `json:"due_date"`
+}
+
+type issueStatistics struct {
+	Statistics struct {
+		Counts struct {
+			Opened int `json:"opened"`
+			Closed int `json:"closed"`
+		} `json:"counts"`
+	} `json:"statistics"`
+}
+
+type milestoneStat struct {
+	opened, closed int
+	due            time.Time
 }
 
 type job struct {
@@ -415,6 +452,9 @@ type store struct {
 	mrStates        map[string]map[string]int
 	mrMerge         map[string]*histogram
 	mrSeen          map[int]time.Time
+	unassigned      map[string]int
+	storage         map[storageKey]float64
+	milestones      map[string]milestoneStat
 	retried         map[retryKey]*counter
 	retryPassed     map[retryKey]*counter
 	retriedSeen     map[int]time.Time
@@ -431,6 +471,7 @@ func newStore() *store {
 	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
 		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{},
 		mrOldest: map[string]time.Time{}, mrStates: map[string]map[string]int{}, mrMerge: map[string]*histogram{}, mrSeen: map[int]time.Time{},
+		unassigned: map[string]int{}, storage: map[storageKey]float64{}, milestones: map[string]milestoneStat{},
 		retried: map[retryKey]*counter{}, retryPassed: map[retryKey]*counter{}, retriedSeen: map[int]time.Time{}, attempts: map[attemptKey]*attempt{}, testFailures: map[testKey]*counter{}}
 }
 
@@ -714,7 +755,7 @@ func (s *store) addTestFailures(projectPath string, r testReport) (dropped int) 
 			if c.Classname != "" {
 				name = c.Classname + "." + c.Name
 			}
-			k := testKey{projectPath, truncateRunes(suite.Name, maxTestLen), truncateRunes(name, maxTestLen)}
+			k := testKey{projectPath, truncateRunes(suite.Name, maxLabelLen), truncateRunes(name, maxLabelLen)}
 			if _, ok := s.testFailures[k]; !ok && len(s.testFailures) >= maxTestSeries {
 				dropped++
 				continue
@@ -741,13 +782,17 @@ func jobTime(j job) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func refused(err error) bool {
+	return isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound })
+}
+
 func isStatus(err error, match func(code int) bool) bool {
 	var se *statusError
 	return errors.As(err, &se) && match(se.code)
 }
 
 func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store, log *slog.Logger) error {
-	projects, capped, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&per_page=100", maxProjectPages, nil)
+	projects, capped, err := get[project](ctx, g, "groups/"+url.PathEscape(group)+"/projects?include_subgroups=true&archived=false&statistics=true&per_page=100", maxProjectPages, nil)
 	if err != nil {
 		return err
 	}
@@ -772,6 +817,8 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	mrSnap := map[string]int{}
 	oldestSnap := map[string]time.Time{}
 	stateSnap := map[string]map[string]int{}
+	unassignedSnap := map[string]int{}
+	storageSnap := map[storageKey]float64{}
 	pipelineSnap := map[string]map[string]int{}
 	for _, st := range pipelineStatuses {
 		pipelineSnap[st] = map[string]int{}
@@ -780,6 +827,11 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		// The count comes with the project list, so a project whose other reads are refused still has one.
 		if p.OpenIssues != nil {
 			issueSnap[p.PathWithNamespace] = *p.OpenIssues
+		}
+		for _, sk := range storageKinds {
+			if v, ok := p.Statistics[sk.field]; ok {
+				storageSnap[storageKey{p.PathWithNamespace, sk.kind}] = v
+			}
 		}
 		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&include_retried=true&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
@@ -854,6 +906,23 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if fatal := pollMerged(ctx, g, p, since, s, log, &errs); fatal != nil {
 			return fatal
 		}
+		if p.OpenIssues == nil {
+			continue
+		}
+		n, ok, err := unassignedIssues(ctx, g, p, log)
+		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
+			if fatal != nil {
+				return fatal
+			}
+			continue
+		}
+		if ok {
+			unassignedSnap[p.PathWithNamespace] = n
+		}
+	}
+	milestones, fatal := pollMilestones(ctx, g, group, s, log, &errs)
+	if fatal != nil {
+		return fatal
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -866,6 +935,9 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 	s.openMRs = mrSnap
 	s.mrOldest = oldestSnap
 	s.mrStates = stateSnap
+	s.unassigned = unassignedSnap
+	s.storage = storageSnap
+	s.milestones = milestones
 	s.mu.Unlock()
 	return nil
 }
@@ -1036,12 +1108,66 @@ func pollMerged(ctx context.Context, g gitlab, p project, since time.Time, s *st
 	return nil
 }
 
+// unassignedIssues reads the total from the X-Total header of a one-item page, like the merge
+// request total of old, and leaves the project without a series when GitLab sends none.
+func unassignedIssues(ctx context.Context, g gitlab, p project, log *slog.Logger) (n int, ok bool, err error) {
+	_, hdr, err := g.fetch(ctx, fmt.Sprintf("projects/%d/issues?state=opened&assignee_id=None&per_page=1", p.ID))
+	if err != nil {
+		return 0, false, err
+	}
+	n, err = strconv.Atoi(hdr.Get("X-Total"))
+	if err != nil || n < 0 {
+		log.Warn("GitLab sent no total of unassigned issues, so the project has no series", "project", p.PathWithNamespace)
+		return 0, false, nil
+	}
+	return n, true, nil
+}
+
+// pollMilestones reads the group's active milestones, first page only, and the issue counts of
+// each. A read GitLab refuses with 403 or 404 gives no milestone series and is not counted as a
+// skipped project; the group's path stands in for a project in the error messages.
+func pollMilestones(ctx context.Context, g gitlab, group string, s *store, log *slog.Logger, errs *[]error) (map[string]milestoneStat, error) {
+	snap := map[string]milestoneStat{}
+	gp := project{PathWithNamespace: group}
+	base := "groups/" + url.PathEscape(group)
+	list, _, err := get[milestone](ctx, g, base+fmt.Sprintf("/milestones?state=active&per_page=%d", maxMilestones), 1, nil)
+	if refused(err) {
+		log.Debug("skipping the milestones GitLab will not show", "group", group, "err", err)
+		return snap, nil
+	}
+	if skip, fatal := classify(err, gp, s, log, errs); skip || fatal != nil {
+		return snap, fatal
+	}
+	for _, m := range list {
+		title := truncateRunes(m.Title, maxLabelLen)
+		if _, dup := snap[title]; dup || m.Title == "" {
+			continue
+		}
+		st, err := getJSON[issueStatistics](ctx, g, base+"/issues_statistics?milestone="+url.QueryEscape(m.Title))
+		if refused(err) {
+			continue
+		}
+		if skip, fatal := classify(err, gp, s, log, errs); skip || fatal != nil {
+			if fatal != nil {
+				return snap, fatal
+			}
+			continue
+		}
+		ms := milestoneStat{opened: st.Statistics.Counts.Opened, closed: st.Statistics.Counts.Closed}
+		if d, err := time.Parse("2006-01-02", m.DueDate); err == nil {
+			ms.due = d
+		}
+		snap[title] = ms
+	}
+	return snap, nil
+}
+
 // classify sorts a failed project read: skip it, end the poll (fatal), or remember the error and go on.
 func classify(err error, p project, s *store, log *slog.Logger, errs *[]error) (skip bool, fatal error) {
 	switch {
 	case err == nil:
 		return false, nil
-	case isStatus(err, func(c int) bool { return c == http.StatusForbidden || c == http.StatusNotFound }):
+	case refused(err):
 		log.Debug("skipping a project GitLab will not show", "project", p.PathWithNamespace, "err", err)
 		s.count(&s.projectsSkipped)
 		return true, nil
@@ -1108,6 +1234,7 @@ func (s *store) writeOpenCounts(w *strings.Builder) {
 	}{
 		{"ci_project_open_issues", "Open issues of a project at the last good poll; no series when the project has issues disabled.", s.openIssues},
 		{"ci_project_open_merge_requests", "Open merge requests of a project at the last good poll; no series when GitLab sent no total.", s.openMRs},
+		{"ci_issues_unassigned", "Open issues without an assignee at the last good poll; no series when the project has issues disabled or GitLab sent no total.", s.unassigned},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", m.name, m.help, m.name)
 		projects := make([]string, 0, len(m.counts))
@@ -1193,6 +1320,38 @@ func (s *store) writeCounters(w *strings.Builder) {
 	}
 }
 
+func (s *store) writeGroupGauges(w *strings.Builder) {
+	titles := make([]string, 0, len(s.milestones))
+	for t := range s.milestones {
+		titles = append(titles, t)
+	}
+	sort.Strings(titles)
+	fmt.Fprint(w, "# HELP ci_milestone_issues Issues of an active group milestone by state (opened or closed) at the last good poll.\n# TYPE ci_milestone_issues gauge\n")
+	for _, t := range titles {
+		fmt.Fprintf(w, "ci_milestone_issues{milestone=\"%s\",state=\"opened\"} %d\nci_milestone_issues{milestone=\"%s\",state=\"closed\"} %d\n", escLabel(t), s.milestones[t].opened, escLabel(t), s.milestones[t].closed)
+	}
+	fmt.Fprint(w, "# HELP ci_milestone_due_timestamp_seconds Due date of an active group milestone as a Unix time; no series for a milestone without one.\n# TYPE ci_milestone_due_timestamp_seconds gauge\n")
+	for _, t := range titles {
+		if due := s.milestones[t].due; !due.IsZero() {
+			fmt.Fprintf(w, "ci_milestone_due_timestamp_seconds{milestone=\"%s\"} %d\n", escLabel(t), due.Unix())
+		}
+	}
+	fmt.Fprint(w, "# HELP ci_project_storage_bytes Storage a project uses by kind, from GitLab's project statistics at the last good poll; no series when GitLab sends none.\n# TYPE ci_project_storage_bytes gauge\n")
+	keys := make([]storageKey, 0, len(s.storage))
+	for k := range s.storage {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].project != keys[j].project {
+			return keys[i].project < keys[j].project
+		}
+		return keys[i].kind < keys[j].kind
+	})
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_project_storage_bytes{project=\"%s\",kind=\"%s\"} %g\n", escLabel(k.project), k.kind, s.storage[k])
+	}
+}
+
 func escLabel(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 
 func pipelineLabel(k pipelineKey) string {
@@ -1242,6 +1401,7 @@ func (s *store) write(w *strings.Builder) {
 	s.writeOpenCounts(w)
 	s.writeMergeRequests(w)
 	s.writeCounters(w)
+	s.writeGroupGauges(w)
 	s.writeFinishedPipelines(w)
 	for _, m := range []struct {
 		name, help string
