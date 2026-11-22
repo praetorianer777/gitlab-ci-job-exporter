@@ -33,6 +33,9 @@ const (
 	maxWindow        = 6 * time.Hour
 	maxJobPages      = 20
 	maxMRStateLen    = 32
+	maxTestLen       = 128
+	maxFailedCases   = 50
+	maxTestSeries    = 2000
 	maxProjectPages  = 1000
 	maxBodyBytes     = 32 << 20
 	maxDrainBytes    = 1 << 20
@@ -161,10 +164,13 @@ type job struct {
 	CreatedAt      string   `json:"created_at"`
 	TagList        []string `json:"tag_list"`
 	FinishedAt     string   `json:"finished_at"`
-	Runner         *struct {
+	// Retried is set by GitLab versions that mark a job replaced by a retry; the others leave it out.
+	Retried bool `json:"retried"`
+	Runner  *struct {
 		Description string `json:"description"`
 	} `json:"runner"`
 	Pipeline struct {
+		ID     int    `json:"id"`
 		Source string `json:"source"`
 	} `json:"pipeline"`
 }
@@ -350,6 +356,42 @@ type seenPipeline struct {
 	finished string
 }
 
+type retryKey struct{ project, job, ref string }
+
+type testKey struct{ project, suite, test string }
+
+// counter is a monotonic count that expires with its series.
+type counter struct {
+	n    float64
+	last time.Time
+}
+
+func bump[K comparable](m map[K]*counter, k K, now time.Time) {
+	c := m[k]
+	if c == nil {
+		c = &counter{}
+		m[k] = c
+	}
+	c.n++
+	c.last = now
+}
+
+// attemptKey names one job of one pipeline: a retry runs under the same pipeline id and name.
+type attemptKey struct {
+	pipeline int
+	name     string
+}
+
+// attempt is the newest run of a job seen so far, with what is needed to count it once a newer one shows up.
+type attempt struct {
+	id           int
+	status       string
+	rk           retryKey
+	finished     time.Time
+	failedBefore bool
+	passed       bool
+}
+
 type pendingStat struct {
 	count  int
 	oldest time.Time
@@ -373,6 +415,11 @@ type store struct {
 	mrStates        map[string]map[string]int
 	mrMerge         map[string]*histogram
 	mrSeen          map[int]time.Time
+	retried         map[retryKey]*counter
+	retryPassed     map[retryKey]*counter
+	retriedSeen     map[int]time.Time
+	attempts        map[attemptKey]*attempt
+	testFailures    map[testKey]*counter
 	lastPoll        time.Time
 	lastPollSeconds float64
 	pollError       float64
@@ -383,7 +430,8 @@ type store struct {
 func newStore() *store {
 	return &store{now: time.Now, pending: map[pendingKey]*pendingStat{}, pipelines: map[string]map[string]int{}, duration: map[key]*histogram{}, queued: map[key]*histogram{}, seen: map[int]time.Time{},
 		pipeDuration: map[pipelineKey]*histogram{}, pipeQueued: map[pipelineKey]*histogram{}, pipeSeen: map[seenPipeline]time.Time{}, defaultFailed: map[string]int{}, openIssues: map[string]int{}, openMRs: map[string]int{},
-		mrOldest: map[string]time.Time{}, mrStates: map[string]map[string]int{}, mrMerge: map[string]*histogram{}, mrSeen: map[int]time.Time{}}
+		mrOldest: map[string]time.Time{}, mrStates: map[string]map[string]int{}, mrMerge: map[string]*histogram{}, mrSeen: map[int]time.Time{},
+		retried: map[retryKey]*counter{}, retryPassed: map[retryKey]*counter{}, retriedSeen: map[int]time.Time{}, attempts: map[attemptKey]*attempt{}, testFailures: map[testKey]*counter{}}
 }
 
 // tagsLabel makes the same set of runner tags one label value whatever order GitLab lists them in.
@@ -449,7 +497,17 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 	if j.Runner != nil && j.Runner.Description != "" {
 		runner = j.Runner.Description
 	}
-	k := key{projectPath, name, part, runner, j.Status, refKind(j.Ref, j.Pipeline.Source, false, defaultRef)}
+	ref := refKind(j.Ref, j.Pipeline.Source, false, defaultRef)
+	rk := retryKey{projectPath, name, ref}
+	if j.Retried {
+		s.markRetried(j.ID, rk, finished, now)
+	}
+	s.trackAttempt(j, rk, finished, now)
+	// The histograms keep their meaning: only the run that was not replaced by a retry.
+	if j.Retried {
+		return
+	}
+	k := key{projectPath, name, part, runner, j.Status, ref}
 	for _, o := range []struct {
 		m map[key]*histogram
 		v *float64
@@ -463,6 +521,40 @@ func (s *store) add(projectPath string, j job, defaultRef string) {
 			o.m[k] = h
 		}
 		h.observe(*o.v, now)
+	}
+}
+
+func (s *store) markRetried(id int, rk retryKey, finished, now time.Time) {
+	if _, ok := s.retriedSeen[id]; ok {
+		return
+	}
+	s.retriedSeen[id] = finished
+	bump(s.retried, rk, now)
+}
+
+// trackAttempt finds retries by comparing runs of the same job in the same pipeline, since the
+// older run is not necessarily marked and may have been read in an earlier poll. The caller holds the lock.
+func (s *store) trackAttempt(j job, rk retryKey, finished, now time.Time) {
+	if j.Pipeline.ID == 0 {
+		return
+	}
+	ak := attemptKey{j.Pipeline.ID, j.Name}
+	a := s.attempts[ak]
+	if a == nil {
+		s.attempts[ak] = &attempt{id: j.ID, status: j.Status, rk: rk, finished: finished}
+		return
+	}
+	if j.ID < a.id {
+		s.markRetried(j.ID, rk, finished, now)
+		a.failedBefore = a.failedBefore || j.Status == "failed"
+	} else {
+		s.markRetried(a.id, a.rk, a.finished, now)
+		a.failedBefore = a.failedBefore || a.status == "failed"
+		a.id, a.status, a.rk, a.finished = j.ID, j.Status, rk, finished
+	}
+	if a.status == "success" && a.failedBefore && !a.passed {
+		a.passed = true
+		bump(s.retryPassed, a.rk, now)
 	}
 }
 
@@ -481,18 +573,18 @@ func refKind(ref, source string, tag bool, defaultRef string) string {
 
 // addPipeline records a finished pipeline once per finish: its time from creation to the end, which is what
 // someone waiting on it sees, and how long it waited before its first job started.
-func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef string) {
+func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef string) (added bool) {
 	created, err1 := time.Parse(time.RFC3339, p.CreatedAt)
 	finished, err2 := time.Parse(time.RFC3339, p.FinishedAt)
 	if err1 != nil || err2 != nil {
-		return
+		return false
 	}
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sk := seenPipeline{p.ID, p.FinishedAt}
 	if _, ok := s.pipeSeen[sk]; ok {
-		return
+		return false
 	}
 	s.pipeSeen[sk] = finished
 	k := pipelineKey{projectPath, p.Status, refKind(p.Ref, p.Source, p.Tag, defaultRef)}
@@ -508,6 +600,7 @@ func (s *store) addPipeline(projectPath string, p finishedPipeline, defaultRef s
 	if p.QueuedDuration != nil {
 		observe(s.pipeQueued, *p.QueuedDuration)
 	}
+	return true
 }
 
 // addMerged records a merge request once, by id, from its creation to its merge. A merge
@@ -551,6 +644,16 @@ func (s *store) forget(before time.Time) {
 			delete(s.mrSeen, id)
 		}
 	}
+	for id, t := range s.retriedSeen {
+		if t.Before(before) {
+			delete(s.retriedSeen, id)
+		}
+	}
+	for k, a := range s.attempts {
+		if a.finished.Before(before) {
+			delete(s.attempts, k)
+		}
+	}
 }
 
 // expire drops series that saw no job for ttl, so renamed jobs and runners
@@ -577,6 +680,49 @@ func (s *store) expire(now time.Time, ttl time.Duration) {
 			delete(s.mrMerge, k)
 		}
 	}
+	for _, m := range []map[retryKey]*counter{s.retried, s.retryPassed} {
+		for k, c := range m {
+			if now.Sub(c.last) > ttl {
+				delete(m, k)
+			}
+		}
+	}
+	for k, c := range s.testFailures {
+		if now.Sub(c.last) > ttl {
+			delete(s.testFailures, k)
+		}
+	}
+}
+
+// addTestFailures counts the failed cases of one pipeline, at most maxFailedCases of them. A
+// series beyond maxTestSeries is dropped, so a broken suite cannot grow the exporter without bound.
+func (s *store) addTestFailures(projectPath string, r testReport) (dropped int) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	taken := 0
+	for _, suite := range r.TestSuites {
+		for _, c := range suite.TestCases {
+			if c.Status != "failed" && c.Status != "error" {
+				continue
+			}
+			if taken >= maxFailedCases {
+				return dropped
+			}
+			taken++
+			name := c.Name
+			if c.Classname != "" {
+				name = c.Classname + "." + c.Name
+			}
+			k := testKey{projectPath, truncateRunes(suite.Name, maxTestLen), truncateRunes(name, maxTestLen)}
+			if _, ok := s.testFailures[k]; !ok && len(s.testFailures) >= maxTestSeries {
+				dropped++
+				continue
+			}
+			bump(s.testFailures, k, now)
+		}
+	}
+	return dropped
 }
 
 func (s *store) count(c *float64) {
@@ -635,7 +781,7 @@ func poll(ctx context.Context, g gitlab, group string, since time.Time, s *store
 		if p.OpenIssues != nil {
 			issueSnap[p.PathWithNamespace] = *p.OpenIssues
 		}
-		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&per_page=100", p.ID), maxJobPages, older)
+		jobs, capped, err := get[job](ctx, g, fmt.Sprintf("projects/%d/jobs?scope[]=success&scope[]=failed&scope[]=canceled&include_retried=true&per_page=100", p.ID), maxJobPages, older)
 		if skip, fatal := classify(err, p, s, log, &errs); skip || fatal != nil {
 			if fatal != nil {
 				return fatal
@@ -736,6 +882,7 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 		log.Warn("stopped paging a project's finished pipelines at the page limit", "project", p.PathWithNamespace, "pages", maxJobPages)
 		s.count(&s.pageCapHits)
 	}
+	reports := true
 	for _, item := range list {
 		body, _, err := g.fetch(ctx, fmt.Sprintf("projects/%d/pipelines/%d", p.ID, item.ID))
 		var fp finishedPipeline
@@ -750,8 +897,12 @@ func pollPipelines(ctx context.Context, g gitlab, p project, since time.Time, s 
 			}
 			continue
 		}
-		if t, err := time.Parse(time.RFC3339, fp.FinishedAt); err == nil && !t.Before(since) {
-			s.addPipeline(p.PathWithNamespace, fp, p.DefaultBranch)
+		if t, err := time.Parse(time.RFC3339, fp.FinishedAt); err == nil && !t.Before(since) &&
+			s.addPipeline(p.PathWithNamespace, fp, p.DefaultBranch) && fp.Status == "failed" && reports {
+			var fatal error
+			if reports, fatal = pollTestReport(ctx, g, p, fp.ID, s, log, errs); fatal != nil {
+				return fatal
+			}
 		}
 	}
 	if p.DefaultBranch == "" {
@@ -778,6 +929,56 @@ type mrFlow struct {
 	hasTotal bool
 	oldest   time.Time
 	byState  map[string]int
+}
+
+type testSummary struct {
+	Total struct {
+		Count int `json:"count"`
+	} `json:"total"`
+}
+
+type testReport struct {
+	TestSuites []struct {
+		Name      string `json:"name"`
+		TestCases []struct {
+			Status    string `json:"status"`
+			Name      string `json:"name"`
+			Classname string `json:"classname"`
+		} `json:"test_cases"`
+	} `json:"test_suites"`
+}
+
+func getJSON[T any](ctx context.Context, g gitlab, path string) (v T, err error) {
+	body, _, err := g.fetch(ctx, path)
+	if err != nil {
+		return v, err
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return v, fmt.Errorf("GET %s: %w", path, err)
+	}
+	return v, nil
+}
+
+// pollTestReport counts the failed test cases of one failed pipeline. The small summary comes
+// first, so a pipeline without a report costs one read. more is false once GitLab refuses the
+// reads, so the project's other failed pipelines do not ask again in this poll.
+func pollTestReport(ctx context.Context, g gitlab, p project, pipelineID int, s *store, log *slog.Logger, errs *[]error) (more bool, fatal error) {
+	base := fmt.Sprintf("projects/%d/pipelines/%d/", p.ID, pipelineID)
+	sum, err := getJSON[testSummary](ctx, g, base+"test_report_summary")
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return false, fatal
+	}
+	if sum.Total.Count == 0 {
+		return true, nil
+	}
+	rep, err := getJSON[testReport](ctx, g, base+"test_report")
+	if skip, fatal := classify(err, p, s, log, errs); skip || fatal != nil {
+		return false, fatal
+	}
+	if n := s.addTestFailures(p.PathWithNamespace, rep); n > 0 {
+		log.Warn("left out failed test cases over the limit", "project", p.PathWithNamespace, "pipeline", pipelineID, "left_out", n)
+	}
+	return true, nil
 }
 
 // openMergeRequests pages through the open merge requests, oldest first, so the oldest one that is
@@ -963,6 +1164,35 @@ func (s *store) writeMergeRequests(w *strings.Builder) {
 	}
 }
 
+func (s *store) writeCounters(w *strings.Builder) {
+	for _, m := range []struct {
+		name, help string
+		c          map[retryKey]*counter
+	}{
+		{"ci_job_retried_total", "Finished jobs that were later retried, each job run counted once.", s.retried},
+		{"ci_job_retry_passed_total", "Jobs that failed and whose retry in the same pipeline succeeded, counted once per job and pipeline.", s.retryPassed},
+	} {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", m.name, m.help, m.name)
+		keys := make([]retryKey, 0, len(m.c))
+		for k := range m.c {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
+		for _, k := range keys {
+			fmt.Fprintf(w, "%s{project=\"%s\",job=\"%s\",ref=\"%s\"} %g\n", m.name, escLabel(k.project), escLabel(k.job), escLabel(k.ref), m.c[k].n)
+		}
+	}
+	fmt.Fprint(w, "# HELP ci_test_failures_total Failed test cases of failed pipelines, from their test reports, each pipeline counted once.\n# TYPE ci_test_failures_total counter\n")
+	keys := make([]testKey, 0, len(s.testFailures))
+	for k := range s.testFailures {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return fmt.Sprint(keys[i]) < fmt.Sprint(keys[j]) })
+	for _, k := range keys {
+		fmt.Fprintf(w, "ci_test_failures_total{project=\"%s\",suite=\"%s\",test=\"%s\"} %g\n", escLabel(k.project), escLabel(k.suite), escLabel(k.test), s.testFailures[k].n)
+	}
+}
+
 func escLabel(v string) string { return labelEscaper.Replace(strings.ToValidUTF8(v, "\uFFFD")) }
 
 func pipelineLabel(k pipelineKey) string {
@@ -1011,6 +1241,7 @@ func (s *store) write(w *strings.Builder) {
 	s.writePipelines(w)
 	s.writeOpenCounts(w)
 	s.writeMergeRequests(w)
+	s.writeCounters(w)
 	s.writeFinishedPipelines(w)
 	for _, m := range []struct {
 		name, help string
