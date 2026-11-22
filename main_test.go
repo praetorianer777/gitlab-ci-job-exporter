@@ -464,10 +464,10 @@ func TestPendingJobsAreCountedPerProjectAndSortedTags(t *testing.T) {
 	var status atomic.Int32
 	now := time.Now().Truncate(time.Second)
 	body.Store(fmt.Sprintf(`[
-	  {"id":1,"tag_list":["light","heavy"],"created_at":%q},
-	  {"id":2,"tag_list":["heavy","light"],"created_at":%q},
-	  {"id":3,"tag_list":["heavy"],"created_at":%q},
-	  {"id":4,"tag_list":[],"created_at":%q}
+	  {"id":1,"status":"pending","tag_list":["light","heavy"],"created_at":%q},
+	  {"id":2,"status":"pending","tag_list":["heavy","light"],"created_at":%q},
+	  {"id":3,"status":"pending","tag_list":["heavy"],"created_at":%q},
+	  {"id":4,"status":"pending","tag_list":[],"created_at":%q}
 	]`, stamp(now.Add(-10*time.Minute)), stamp(now.Add(-90*time.Second)), stamp(now.Add(-30*time.Second)), stamp(now.Add(-5*time.Second))))
 	srv := pendingGitLab(t, &body, &status)
 	g := gitlab{base: srv.URL, token: "t", client: newClient()}
@@ -495,7 +495,7 @@ func TestPendingSnapshotIsReplacedAndFailedPollKeepsIt(t *testing.T) {
 	var body atomic.Value
 	var status atomic.Int32
 	now := time.Now()
-	body.Store(fmt.Sprintf(`[{"id":1,"tag_list":["heavy"],"created_at":%q}]`, stamp(now)))
+	body.Store(fmt.Sprintf(`[{"id":1,"status":"pending","tag_list":["heavy"],"created_at":%q}]`, stamp(now)))
 	srv := pendingGitLab(t, &body, &status)
 	g := gitlab{base: srv.URL, token: "t", client: newClient()}
 	s := newStore()
@@ -571,7 +571,7 @@ func TestPendingPagingIsCapped(t *testing.T) {
 		}
 		pages.Add(1)
 		w.Header().Set("X-Next-Page", "2")
-		fmt.Fprint(w, `[{"id":1,"tag_list":["a"]}]`)
+		fmt.Fprint(w, `[{"id":1,"status":"pending","tag_list":["a"]}]`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -1448,5 +1448,34 @@ func TestAProjectScheduledForDeletionIsSkipped(t *testing.T) {
 	}
 	if n := reads.Load(); n != 0 {
 		t.Errorf("the project scheduled for deletion was read %d times", n)
+	}
+}
+
+func TestRunningAndCreatedJobsAreCountedFromTheSameRead(t *testing.T) {
+	var body atomic.Value
+	var status atomic.Int32
+	body.Store(`[
+	  {"id":1,"status":"pending","tag_list":["heavy"]},
+	  {"id":2,"status":"running","tag_list":["heavy"],"runner":{"description":"ovh machine"}},
+	  {"id":3,"status":"running","tag_list":["heavy"],"runner":{"description":"ovh machine"}},
+	  {"id":4,"status":"running","tag_list":[],"runner":{"description":"tobi-runner-1"}},
+	  {"id":5,"status":"created","tag_list":["heavy"]},
+	  {"id":6,"status":"created","tag_list":[]}
+	]`)
+	srv := pendingGitLab(t, &body, &status)
+	s := newStore()
+	if err := poll(context.Background(), gitlab{base: srv.URL, token: "t", client: newClient()}, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		`ci_jobs_pending{project="g/a",tags="heavy"} 1`,
+		`ci_jobs_running{project="g/a",tags="",runner="tobi-runner-1"} 1`,
+		`ci_jobs_running{project="g/a",tags="heavy",runner="ovh machine"} 2`,
+		`ci_jobs_created{project="g/a"} 2`,
+	} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("metrics lack %s:\n%s", want, out)
+		}
 	}
 }
