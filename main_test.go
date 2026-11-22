@@ -798,3 +798,106 @@ func TestMissingPipelineDetailIsSkippedNotAnError(t *testing.T) {
 		t.Errorf("calls=%d, metrics:\n%s", calls.Load(), render(s))
 	}
 }
+
+// openCountsGitLab serves three projects: one with both counts, one with issues disabled
+// and one whose merge request total GitLab leaves out. A test can change the counts or break the reads.
+func openCountsGitLab(t *testing.T, issues, mrs *atomic.Int32, status *atomic.Int32) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/groups/g/projects", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"id":1,"path_with_namespace":"g/b","open_issues_count":%d},{"id":2,"path_with_namespace":"g/a"},{"id":3,"path_with_namespace":"g/huge","open_issues_count":0}]`, issues.Load())
+	})
+	for _, id := range []string{"1", "2", "3"} {
+		mux.HandleFunc("/api/v4/projects/"+id+"/jobs", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/pipelines", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+		mux.HandleFunc("/api/v4/projects/"+id+"/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+			if c := status.Load(); c != 0 {
+				http.Error(w, "no", int(c))
+				return
+			}
+			if q := r.URL.Query(); q.Get("state") != "opened" || q.Get("per_page") != "1" {
+				http.Error(w, "unexpected query", http.StatusBadRequest)
+				return
+			}
+			if id != "3" {
+				w.Header().Set("X-Total", fmt.Sprint(mrs.Load()))
+			}
+			fmt.Fprint(w, `[]`)
+		})
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestOpenCountsAreExportedPerProjectAndSorted(t *testing.T) {
+	var issues, mrs, status atomic.Int32
+	issues.Store(5)
+	mrs.Store(3)
+	srv := openCountsGitLab(t, &issues, &mrs, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	for _, want := range []string{
+		"# TYPE ci_project_open_issues gauge\n",
+		"# TYPE ci_project_open_merge_requests gauge\n",
+		`ci_project_open_issues{project="g/b"} 5` + "\n" + `ci_project_open_issues{project="g/huge"} 0` + "\n",
+		`ci_project_open_merge_requests{project="g/a"} 3` + "\n" + `ci_project_open_merge_requests{project="g/b"} 3` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("metrics lack\n  %s\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `ci_project_open_issues{project="g/a"}`) {
+		t.Errorf("a project with issues disabled has an issue series:\n%s", out)
+	}
+	if strings.Contains(out, `ci_project_open_merge_requests{project="g/huge"}`) {
+		t.Errorf("a project without an X-Total header has a merge request series:\n%s", out)
+	}
+}
+
+func TestOpenCountsAreReplacedAndFailedPollKeepsThem(t *testing.T) {
+	var issues, mrs, status atomic.Int32
+	issues.Store(5)
+	mrs.Store(3)
+	srv := openCountsGitLab(t, &issues, &mrs, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+
+	issues.Store(7)
+	mrs.Store(0)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil {
+		t.Fatal(err)
+	}
+	out := render(s)
+	if !strings.Contains(out, `ci_project_open_issues{project="g/b"} 7`) || !strings.Contains(out, `ci_project_open_merge_requests{project="g/b"} 0`) {
+		t.Errorf("a second poll did not replace the counts:\n%s", out)
+	}
+
+	issues.Store(9)
+	mrs.Store(4)
+	status.Store(http.StatusInternalServerError)
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err == nil {
+		t.Fatal("poll with a failing merge request read returned no error")
+	}
+	out = render(s)
+	if !strings.Contains(out, `ci_project_open_issues{project="g/b"} 7`) || !strings.Contains(out, `ci_project_open_merge_requests{project="g/b"} 0`) {
+		t.Errorf("a failed poll dropped the last counts:\n%s", out)
+	}
+}
+
+func TestForbiddenMergeRequestReadIsSkippedNotAnError(t *testing.T) {
+	var issues, mrs, status atomic.Int32
+	status.Store(http.StatusForbidden)
+	srv := openCountsGitLab(t, &issues, &mrs, &status)
+	g := gitlab{base: srv.URL, token: "t", client: newClient()}
+	s := newStore()
+	if err := poll(context.Background(), g, "g", time.Now(), s, quiet); err != nil || s.projectsSkipped != 3 {
+		t.Errorf("err=%v skipped=%v, want no error and 3 skips", err, s.projectsSkipped)
+	}
+}

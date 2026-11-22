@@ -22,6 +22,8 @@ GitLab REST API instead. It is read-only and uses the standard library only.
 | `ci_pipeline_duration_seconds` | histogram | How long a finished pipeline took from its creation to its end, waiting included: what someone waiting on it sees. |
 | `ci_pipeline_queued_seconds` | histogram | How long a finished pipeline waited before its first job started. |
 | `ci_default_branch_failed` | gauge | 1 when the newest finished pipeline of the project's default branch failed, else 0, per `project`. |
+| `ci_project_open_issues` | gauge | Open issues per `project`, from the project list; a project with issues disabled has no series. |
+| `ci_project_open_merge_requests` | gauge | Open merge requests per `project`, from the `X-Total` header of a one-item page; a project for which GitLab sends no total (above 10000) has no series. |
 | `ci_job_exporter_build_info` | gauge | Always 1; the `version` label is the release version. |
 | `ci_job_exporter_last_poll_timestamp_seconds` | gauge | When GitLab was last read without error; 0 before the first success. |
 | `ci_job_exporter_last_poll_duration_seconds` | gauge | How long the last finished poll took. |
@@ -201,6 +203,8 @@ max by (tags) (ci_job_pending_oldest_seconds)
 - Each poll costs, per project, four list reads (finished and waiting jobs,
   pending and running pipelines), two more for finished pipelines and the
   default branch, and one read per pipeline that finished since the last poll.
+  One more small read per project counts its open merge requests; the open
+  issues come with the project list at no extra cost.
 - The counters live in memory and restart from zero with the process. Use
   `rate` or `increase`, which handle resets.
 - A job that finishes between two polls is seen at the next poll, so the
